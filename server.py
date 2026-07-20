@@ -72,7 +72,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.loads(raw)
+            # Log what Hermes actually sends (model name, stream flag)
+            stream = body.get("stream", False)
+            model_req = body.get("model", "?")
+            # Only print this once per session to avoid spam
+            if not hasattr(Handler, "_logged_request"):
+                print(f"[debug] Hermes requests: model={model_req} stream={stream}")
+                Handler._logged_request = True
         except Exception:
             self._json(400, {"error": {"message": "Invalid JSON"}})
             return
@@ -93,19 +101,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"[error] {e}")
             self._json(500, {"error": {"message": str(e)}})
-            return
-        finally:
             _busy.release()
+            return
 
         print(f"[response] {response[:120].replace(chr(10), ' ')}...")
-        self._json(200, {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": body.get("model", "browser-agent"),
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": response}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+
+        if stream:
+            self._stream_response(model_req, response)
+        else:
+            self._json_response(model_req, response)
+        _busy.release()
 
     def do_GET(self):
         if self.path in ("/v1/models", "/v1/models/"):
@@ -122,6 +127,33 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _json_response(self, model_name, text):
+        self._json(200, {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion", "created": int(time.time()),
+            "model": model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": len(text)//4, "completion_tokens": len(text)//4, "total_tokens": len(text)//2},
+        })
+
+    def _stream_response(self, model_name, text):
+        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                  "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}
+        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+        final = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model_name,
+                  "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        self.wfile.write(f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     def log_message(self, *args): pass
 
