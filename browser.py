@@ -316,73 +316,69 @@ class BrowserBridge:
             await self._page.keyboard.press("Enter")
 
     async def wait_for_response(self, timeout_seconds: int = 300) -> str:
-        """Wait for generation to finish, then return the latest assistant message."""
-        stop_sel = self.selectors.get("stop_button")
+        """Wait for generation to finish, then return the latest assistant message.
+        Uses a content-diff approach: capture text before generation, then poll
+        until new text appears and stabilizes. Works across all providers."""
+        # Snapshot current page text before generation starts
+        try:
+            before = await self._page.inner_text("body")
+        except Exception:
+            before = ""
+
         deadline = time.time() + timeout_seconds
+        await asyncio.sleep(0.5)  # brief wait for generation to start
 
-        # Brief wait for generation to start
-        await asyncio.sleep(0.4)
-
-        # Wait until stop button appears (generation started) or response grows
-        started = False
-        start_deadline = time.time() + 8
-        while time.time() < start_deadline:
-            if stop_sel:
-                try:
-                    if await self._page.is_visible(stop_sel, timeout=300):
-                        started = True
-                        break
-                except Exception:
-                    pass
-            # Some UIs never show a stop button — break early if text exists
+        # Poll: wait for new text to appear, then for it to stabilize
+        last_text = before
+        stable_count = 0
+        has_new_content = False
+        while time.time() < deadline:
             try:
-                msgs = await self._page.query_selector_all(self.selectors["response"])
-                if msgs:
-                    started = True
-                    break
+                current = await self._page.inner_text("body")
             except Exception:
-                pass
-            await asyncio.sleep(0.25)
-
-        # Wait for stop button to disappear (generation finished)
-        if started and stop_sel:
-            while time.time() < deadline:
-                try:
-                    visible = await self._page.is_visible(stop_sel, timeout=400)
-                except Exception:
-                    visible = False
-                if not visible:
-                    # Short settle so final tokens land in the DOM
-                    await asyncio.sleep(0.6)
-                    # Double-check it didn't reappear
-                    try:
-                        if not await self._page.is_visible(stop_sel, timeout=300):
-                            break
-                    except Exception:
-                        break
-                await asyncio.sleep(0.35)
-        else:
-            # Poll for text stability (no stop button providers)
-            last_len = -1
-            stable_count = 0
-            while time.time() < deadline:
-                try:
-                    msgs = await self._page.query_selector_all(self.selectors["response"])
-                    if msgs:
-                        txt = await msgs[-1].inner_text()
-                        n = len(txt)
-                        if n == last_len and n > 0:
-                            stable_count += 1
-                            if stable_count >= 3:
-                                break
-                        else:
-                            stable_count = 0
-                            last_len = n
-                except Exception:
-                    pass
                 await asyncio.sleep(0.5)
+                continue
 
-        return await self._read_last_response()
+            # Check if new content appeared (longer than before)
+            if len(current) > len(before) + 50:  # 50 char threshold for noise
+                has_new_content = True
+                if len(current) == len(last_text):
+                    stable_count += 1
+                    if stable_count >= 3:  # stable for 3 consecutive polls
+                        break
+                else:
+                    stable_count = 0
+                    last_text = current
+            elif has_new_content and len(current) == len(last_text):
+                # Content appeared then stopped growing
+                stable_count += 1
+                if stable_count >= 3:
+                    break
+
+            await asyncio.sleep(0.6)
+
+        # Try provider-specific response selector first
+        try:
+            messages = await self._page.query_selector_all(self.selectors["response"])
+            if messages:
+                last = messages[-1]
+                return (await last.inner_text()).strip()
+        except Exception:
+            pass
+
+        # Fallback: return new text since the snapshot
+        try:
+            after = await self._page.inner_text("body")
+            if len(after) > len(before):
+                # Return only the new portion
+                new_text = after[len(before):].strip()
+                # Clean up: remove common UI chrome text
+                lines = [l.strip() for l in new_text.split("\n") if l.strip()]
+                return "\n".join(lines)
+        except Exception:
+            pass
+
+        return "[No response found]"
 
     async def _read_last_response(self) -> str:
         try:

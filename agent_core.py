@@ -48,68 +48,22 @@ def clean_llm_text(text: str) -> str:
 
 
 def build_system_prompt(config: dict, workspace: Optional[str] = None) -> str:
-    """System prompt for the browser chat LLM — no private local identity."""
+    """System prompt for the browser chat LLM — no private local identity.
+    The config.yaml system_prompt already contains all rules. We only append
+    a short environment hint."""
     base = (config.get("system_prompt") or "").rstrip()
     shell_name = "PowerShell" if os.name == "nt" else "bash"
-    # OS kind only — no hostname, release string, or username
-    if os.name == "nt":
-        os_kind = "Windows"
-    elif hasattr(os, "uname"):
-        sysname = os.uname().sysname.lower()
-        os_kind = "macOS" if "darwin" in sysname else "Linux"
-    else:
-        os_kind = "Unix"
-
-    # Only the workspace folder name — never the full path (path contains username)
     ws_name = workspace_label(workspace)
 
-    env = f"""
-ENVIRONMENT
------------
-OS: {os_kind}
-Shell: {shell_name}
-Workspace: {ws_name}  (use relative paths like ./file.py — never absolute paths)
-Privacy: Do not ask for or repeat the user's real name, home directory, or
-paths outside this workspace. Stay on the current task only.
-
-RULES
------
-1. You control a local computer through tool markers. The local agent executes them.
-2. Use EXACT markers on their own lines (plain text, no markdown fences around markers):
-
-[[[SHELL]]]
-command here
-[[[END]]]
-
-[[[FILE path="./relative/path"]]]
-file contents here
-[[[END]]]
-
-[[[READ path="./relative/path"]]]
-
-3. After you emit tool markers, STOP and wait. The agent pastes [TOOL OUTPUT] back.
-4. Prefer [[[FILE ...]]] for creating/editing files. Do NOT use shell heredocs.
-5. One focused step at a time when debugging; batch independent file writes when safe.
-6. When the full task is done, write TASK_COMPLETE on its own line.
-7. Output plain text. Tool markers must appear exactly as shown.
-8. Paths: relative only (./...). Do not explore or list folders outside the workspace.
-9. Do not request personal data, other project trees, or unrelated chat history.
-"""
-
+    env = (
+        f"\n\nENVIRONMENT: {shell_name} shell. "
+        f"Workspace folder: {ws_name}. "
+        f"Use relative paths (./file.py). Stay in the workspace."
+    )
     if os.name == "nt":
-        env += """
-WINDOWS / POWERSHELL NOTES
---------------------------
-- Use PowerShell syntax: dir, Get-ChildItem, New-Item -ItemType Directory -Force
-- Do not use bash-only constructs (ls -la, cat, mkdir -p, && bash chaining)
-- Chain with ;  or separate [[[SHELL]]] blocks
-- Write files with [[[FILE path="..."]]] not Set-Content heredocs
-- Stay inside the workspace; do not cd to the user home or other drives
-"""
+        env += " Use PowerShell commands (dir, New-Item, not ls or mkdir -p)."
 
-    if base:
-        return f"{base}\n\n{env}".strip()
-    return env.strip()
+    return f"{base}{env}".strip()
 
 
 def extract_hermes_user_message(messages: list[dict]) -> tuple[str, str]:
@@ -185,16 +139,15 @@ class AgentLoop:
         self._primed = False
 
     async def prime(self) -> str:
-        """Send system prompt once and wait for acknowledgement."""
+        """Send system prompt. Do NOT wait for a response — the LLM's
+        acknowledgement text would confuse subsequent turns."""
         if self._primed:
             return ""
         prompt = build_system_prompt(self.config)
-        # Final privacy pass on anything leaving the machine toward the chat LLM
         prompt = redact_text(prompt, workspace=self.tools.workspace)
         await self.bridge.send_message(prompt)
-        resp = await self.bridge.wait_for_response()
         self._primed = True
-        return resp
+        return ""
 
     async def run_turn(
         self,
