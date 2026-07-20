@@ -368,11 +368,13 @@ class BrowserBridge:
         return await self._read_last_response()
 
     async def _read_last_response(self) -> str:
+        """Read last response preserving whitespace (indentation matters for code)."""
         try:
             messages = await self._page.query_selector_all(self.selectors["response"])
             if messages:
                 last = messages[-1]
-                text = await last.inner_text()
+                # textContent preserves leading spaces/tabs (inner_text strips them)
+                text = await last.evaluate("el => el.textContent")
                 return text.strip()
         except Exception as e:
             return f"[ERROR reading response: {e}]"
