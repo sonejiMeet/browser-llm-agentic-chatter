@@ -377,12 +377,15 @@ class ToolExecutor:
             p = p.resolve()
         try:
             text = p.read_text(encoding="utf-8")
-            text = _truncate(text, 8000)
+            # Add line numbers so the LLM can reference specific lines
+            lines = text.split("\n")
+            numbered = "\n".join(f"{i+1:4d}|{line}" for i, line in enumerate(lines))
+            numbered = _truncate(numbered, 8000)
             rel = self._rel(p)
             return {
                 "type": "file_read",
                 "path": rel,
-                "result": text,
+                "result": numbered,
             }
         except Exception as e:
             return {"type": "file_read", "path": path_str, "error": str(e)}
