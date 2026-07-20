@@ -317,45 +317,52 @@ class BrowserBridge:
 
     async def wait_for_response(self, timeout_seconds: int = 300) -> str:
         """Wait for generation to finish, then return the latest assistant message.
-        Uses a content-diff approach: capture text before generation, then poll
-        until new text appears and stabilizes. Works across all providers."""
-        # Snapshot current page text before generation starts
+        Uses fast polling + multiple signals (text stability, send button re-enable)."""
         try:
             before = await self._page.inner_text("body")
         except Exception:
             before = ""
 
         deadline = time.time() + timeout_seconds
-        await asyncio.sleep(0.5)  # brief wait for generation to start
+        await asyncio.sleep(0.2)  # brief settle
 
-        # Poll: wait for new text to appear, then for it to stabilize
         last_text = before
         stable_count = 0
-        has_new_content = False
+        has_new = False
         while time.time() < deadline:
+            # Signal 1: send button re-enabled (ChatGPT/Perplexity disable during generation)
+            try:
+                submit = await self._page.query_selector(self.selectors["submit"])
+                if submit:
+                    disabled = await submit.get_attribute("disabled")
+                    if disabled is None and has_new:
+                        await asyncio.sleep(0.15)
+                        break
+            except Exception:
+                pass
+
+            # Signal 2: text stability
             try:
                 current = await self._page.inner_text("body")
             except Exception:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.15)
                 continue
 
-            # Check if new content appeared (longer than before)
-            if len(current) > len(before) + 50:  # 50 char threshold for noise
-                has_new_content = True
+            if len(current) > len(before) + 20:
+                has_new = True
                 if len(current) == len(last_text):
                     stable_count += 1
-                    if stable_count >= 3:  # stable for 3 consecutive polls
+                    if stable_count >= 2:
                         break
                 else:
                     stable_count = 0
                     last_text = current
-            elif has_new_content and len(current) == len(last_text):
-                # Content appeared then stopped growing
+            elif has_new and len(current) == len(last_text):
                 stable_count += 1
-                if stable_count >= 3:
+                if stable_count >= 2:
                     break
 
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.15)  # fast poll
 
         # Try provider-specific response selector first
         try:
