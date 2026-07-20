@@ -316,76 +316,56 @@ class BrowserBridge:
             await self._page.keyboard.press("Enter")
 
     async def wait_for_response(self, timeout_seconds: int = 300) -> str:
-        """Wait for generation to finish, then return the latest assistant message.
-        Uses fast polling + multiple signals (text stability, send button re-enable)."""
+        """Wait for generation to finish. Uses Playwright's native wait_for_selector
+        to watch for the stop button to appear-then-disappear — zero polling overhead.
+        Falls back to fast text-stability check if no stop button exists."""
+        stop_sel = self.selectors.get("stop_button")
+        deadline = time.time() + timeout_seconds
+
+        if stop_sel:
+            # Wait for stop button to appear (generation started)
+            try:
+                await self._page.wait_for_selector(stop_sel, state="visible", timeout=8000)
+            except Exception:
+                pass  # may not appear, continue
+
+            # Wait for stop button to DISAPPEAR (generation done) — native, no polling
+            try:
+                remaining = max(1, deadline - time.time())
+                await self._page.wait_for_selector(
+                    stop_sel, state="hidden", timeout=remaining * 1000
+                )
+                await asyncio.sleep(0.2)  # settle
+                return await self._read_last_response()
+            except Exception:
+                pass  # button didn't hide in time, fall through
+
+        # Fallback: fast text-stability polling (for providers without stop button)
         try:
             before = await self._page.inner_text("body")
         except Exception:
             before = ""
 
-        deadline = time.time() + timeout_seconds
-        await asyncio.sleep(0.2)  # brief settle
-
-        last_text = before
-        stable_count = 0
-        has_new = False
+        await asyncio.sleep(0.3)
+        last_len = len(before)
+        stable = 0
         while time.time() < deadline:
-            # Signal 1: send button re-enabled (ChatGPT/Perplexity disable during generation)
-            try:
-                submit = await self._page.query_selector(self.selectors["submit"])
-                if submit:
-                    disabled = await submit.get_attribute("disabled")
-                    if disabled is None and has_new:
-                        await asyncio.sleep(0.15)
-                        break
-            except Exception:
-                pass
-
-            # Signal 2: text stability
             try:
                 current = await self._page.inner_text("body")
             except Exception:
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.1)
                 continue
-
-            if len(current) > len(before) + 20:
-                has_new = True
-                if len(current) == len(last_text):
-                    stable_count += 1
-                    if stable_count >= 2:
-                        break
-                else:
-                    stable_count = 0
-                    last_text = current
-            elif has_new and len(current) == len(last_text):
-                stable_count += 1
-                if stable_count >= 2:
+            cur_len = len(current)
+            if cur_len > len(before) + 10 and cur_len == last_len:
+                stable += 1
+                if stable >= 2:
                     break
+            elif cur_len != last_len:
+                stable = 0
+                last_len = cur_len
+            await asyncio.sleep(0.1)
 
-            await asyncio.sleep(0.15)  # fast poll
-
-        # Try provider-specific response selector first
-        try:
-            messages = await self._page.query_selector_all(self.selectors["response"])
-            if messages:
-                last = messages[-1]
-                return (await last.inner_text()).strip()
-        except Exception:
-            pass
-
-        # Fallback: return new text since the snapshot
-        try:
-            after = await self._page.inner_text("body")
-            if len(after) > len(before):
-                # Return only the new portion
-                new_text = after[len(before):].strip()
-                # Clean up: remove common UI chrome text
-                lines = [l.strip() for l in new_text.split("\n") if l.strip()]
-                return "\n".join(lines)
-        except Exception:
-            pass
-
-        return "[No response found]"
+        return await self._read_last_response()
 
     async def _read_last_response(self) -> str:
         try:
