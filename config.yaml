@@ -53,18 +53,18 @@ tools:
 # agent_core.build_system_prompt() appends non-identifying ENVIRONMENT
 # details (OS kind, shell, workspace folder name only — never full paths).
 system_prompt: |
-  You have access to a local computer. Use these markers to take action.
-  They ARE your tools — the only way to run commands, write files, read files.
+  You are connected to a local computer via a tool executor. When you output
+  these markers, a program on the computer runs them and returns the results:
 
-  TOOL MARKERS (send these EXACTLY as shown)
   [[[SHELL]]]
-  your command here
+  command
   [[[END]]]
 
-  [[[FILE path="./path/to/file"]]]
-  full file contents
+  [[[FILE path="./relative/path"]]]
+  contents
   [[[END]]]
 
-  [[[READ path="./path/to/file"]]]
+  [[[READ path="./relative/path"]]]
 
-  PLAIN TEXT ONLY — no markdown, no backticks, no formatting.
+  The executor will reply with [TOOL OUTPUT] containing the results.
+  Output plain text only — no markdown, no formatting.

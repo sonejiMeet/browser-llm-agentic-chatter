@@ -51,6 +51,7 @@ _tools: ToolExecutor | None = None
 _agent: AgentLoop | None = None
 _config: dict = {}
 _lock = threading.Lock()
+_last_request: tuple[str, float, str] = ("", 0, "")  # (user_msg, timestamp, cached_response)
 
 
 def _run_in_loop(coro, timeout: int = 600):
@@ -226,7 +227,18 @@ class AgentHandler(BaseHTTPRequestHandler):
         model_req = body.get("model", "browser-agent")
         print(f"\n[request] model={model_req} stream={stream}")
         print(f"  user: {user_content[:120].replace(chr(10), ' ')}...")
-        print("  privacy: history/system/extra context not forwarded to browser LLM")
+
+        # Dedup: Hermes sends stream then non-stream for the same prompt.
+        # Return the cached response instead of hitting the browser LLM twice.
+        global _last_request
+        now = time.time()
+        if user_content == _last_request[0] and (now - _last_request[1]) < 30:
+            print("  dedup: returning cached response (same prompt within 30s)")
+            if stream:
+                self._stream_cached(chat_id, model_req, created, _last_request[2])
+            else:
+                self._send_cached(chat_id, model_req, created, _last_request[2])
+            return
 
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
@@ -235,6 +247,29 @@ class AgentHandler(BaseHTTPRequestHandler):
             self._handle_stream(chat_id, model_req, created, user_content, "")
         else:
             self._handle_sync(chat_id, model_req, created, user_content, "")
+
+    def _cache_response(self, user_msg: str, response_text: str):
+        global _last_request
+        _last_request = (user_msg, time.time(), response_text)
+
+    def _send_cached(self, chat_id, model_name, created, text):
+        self._send_json(200, {
+            "id": chat_id, "object": "chat.completion", "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
+    def _stream_cached(self, chat_id, model_name, created, text):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "keep-alive"); self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        chunk = text[:5000]
+        delta = {"role": "assistant", "content": chunk}
+        self.wfile.write(f"data: {json.dumps({'id':chat_id,'object':'chat.completion.chunk','created':created,'model':model_name,'choices':[{'index':0,'delta':delta,'finish_reason':None}]})}\n\n".encode())
+        self.wfile.write(f"data: {json.dumps({'id':chat_id,'object':'chat.completion.chunk','created':created,'model':model_name,'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
 
     def _handle_sync(self, chat_id, model_name, created, user_content, extra_context):
         try:
@@ -249,6 +284,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
 
         print(f"[response] {response_text[:120].replace(chr(10), ' ')}...")
+        self._cache_response(user_content, response_text)
         self._send_json(200, {
             "id": chat_id,
             "object": "chat.completion",
@@ -351,6 +387,10 @@ class AgentHandler(BaseHTTPRequestHandler):
             pass
 
         print(f"[stream done] final={len(final_text)} chars")
+        # Cache for dedup — Hermes often resends the same prompt
+        if final_text:
+            global _last_request
+            _last_request = (user_content, time.time(), final_text)
 
     def _streamed_substantial(self) -> bool:
         return True  # incremental events are the primary payload
