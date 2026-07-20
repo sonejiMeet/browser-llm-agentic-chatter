@@ -51,6 +51,7 @@ _tools: ToolExecutor | None = None
 _agent: AgentLoop | None = None
 _config: dict = {}
 _lock = threading.Lock()
+_busy = False
 _last_request: tuple[str, float, str] = ("", 0, "")  # (user_msg, timestamp, cached_response)
 
 
@@ -242,6 +243,17 @@ class AgentHandler(BaseHTTPRequestHandler):
                 self._send_cached(chat_id, model_req, created, _last_request[2])
             return
 
+        # Stale session: Hermes resumed an old session with [System:...] noise.
+        # Reset the chat so the browser LLM starts fresh.
+        import re as _re
+        if _re.search(r"\[System:", user_content) or _re.search(r"previous response was cut off", user_content):
+            print("  stale: resetting chat for fresh session")
+            _run_in_loop(_agent.bridge.new_chat(), timeout=10)
+            _agent._primed = False
+            _run_in_loop(_agent.prime(), timeout=60)
+            # Reduce to just the actual user message
+            user_content = _re.sub(r"\[System:.*?\]\s*", "", user_content, flags=_re.DOTALL).strip() or "hi"
+
         if stream:
             self._handle_stream(chat_id, model_req, created, user_content, "")
         else:
@@ -271,16 +283,22 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
 
     def _handle_sync(self, chat_id, model_name, created, user_content, extra_context):
+        global _busy
+        if _busy:
+            self._send_json(429, {"error": {"message": "Server busy — retry", "type": "rate_limit"}})
+            return
+        _busy = True
         try:
-            with _lock:
-                response_text = _run_in_loop(
-                    _collect_turn(user_content, extra_context),
-                    timeout=600,
-                )
+            response_text = _run_in_loop(
+                _collect_turn(user_content, extra_context),
+                timeout=600,
+            )
         except Exception as e:
             print(f"[error] {e}")
             self._send_json(500, {"error": {"message": str(e), "type": "server_error"}})
             return
+        finally:
+            _busy = False
 
         print(f"[response] {response_text[:120].replace(chr(10), ' ')}...")
         self._cache_response(user_content, response_text)
@@ -303,18 +321,26 @@ class AgentHandler(BaseHTTPRequestHandler):
 
     def _handle_stream(self, chat_id, model_name, created, user_content, extra_context):
         """Stream OpenAI SSE chunks as the agent works."""
+        global _busy
+        if _busy:
+            self._send_json(429, {"error": {"message": "Server busy — retry", "type": "rate_limit"}})
+            return
+        _busy = True
+
         q: Queue = Queue()
 
         def runner():
             try:
-                with _lock:
-                    _run_in_loop(
-                        _stream_turn(user_content, extra_context, q),
-                        timeout=600,
-                    )
+                _run_in_loop(
+                    _stream_turn(user_content, extra_context, q),
+                    timeout=600,
+                )
             except Exception as e:
                 q.put(("error", str(e)))
                 q.put(("end", None))
+            finally:
+                global _busy
+                _busy = False
 
         t = threading.Thread(target=runner, daemon=True)
         t.start()

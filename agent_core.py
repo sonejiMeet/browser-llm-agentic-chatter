@@ -99,6 +99,17 @@ def extract_hermes_user_message(messages: list[dict]) -> tuple[str, str]:
 
     user_content = user_parts[-1] if user_parts else ""
 
+    # Strip Hermes system messages ([System: ...]) — session carryover noise
+    if user_content.startswith("[System:"):
+        idx = user_content.find("]")
+        if idx > 0:
+            user_content = user_content[idx + 1:].strip()
+    # Also strip any leading [System: ...] block
+    user_content = re.sub(r"^\[System:.*?\]\s*", "", user_content, flags=re.DOTALL)
+
+    if not user_content:
+        return "hi", ""  # fallback — don't send empty to LLM
+
     # Hermes sometimes embeds multi-turn as "User: ...\n\nAssistant: ...\n\nUser: ..."
     # Keep ONLY the last User: segment — never prior turns or assistant text.
     if user_content and (
