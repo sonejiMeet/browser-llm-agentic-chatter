@@ -116,32 +116,42 @@ class ToolExecutor:
         return results
 
     def format_results(self, results: list[dict]) -> str:
-        """Format execution results for the browser LLM (privacy-redacted)."""
+        """Format execution results for the browser LLM (privacy-redacted).
+        Explicitly flags errors so the LLM knows to FIX, not repeat."""
         if not results:
             return ""
         ws = self.workspace
         lines = ["[TOOL OUTPUT]"]
+        has_error = False
         for r in results:
             if r.get("error"):
+                has_error = True
                 err = redact_text(str(r["error"]), workspace=ws)
-                lines.append(f"ERROR ({r['type']}): {err}")
+                lines.append(f"FAILED ({r['type']}): {err}")
             else:
                 body = redact_text(r.get("result", "") or "", workspace=ws)
                 if r["type"] == "file_write" and r.get("diff"):
                     path = redact_path_for_llm(r.get("path", "?"), workspace=ws)
                     diff = redact_text(r["diff"], workspace=ws)
                     lines.append(
-                        f"file_write result: wrote {r.get('bytes', '?')} bytes to {path}\n"
+                        f"OK file_write: wrote {r.get('bytes', '?')} bytes to {path}\n"
                         f"{diff}"
                     )
                 else:
-                    lines.append(f"{r['type']} result:\n{_truncate(body, 5000)}")
+                    lines.append(f"OK {r['type']}:\n{_truncate(body, 5000)}")
         lines.append("[/TOOL OUTPUT]")
-        lines.append(
-            "Continue the task. Issue more [[[...]]] tool calls if needed, "
-            "or write TASK_COMPLETE when fully done. "
-            "Use relative paths only; stay inside the workspace."
-        )
+
+        if has_error:
+            lines.append(
+                "The command(s) above FAILED. Read the error, CHANGE your approach, "
+                "and try a DIFFERENT fix. Do NOT repeat the same failing command or code. "
+                "Use [[[READ ...]]] to inspect files before editing them."
+            )
+        else:
+            lines.append(
+                "Continue the task. Issue more [[[...]]] tool calls if needed, "
+                "or write SUMMARY + TASK_COMPLETE when done."
+            )
         return "\n".join(lines)
 
     def format_agent_report(self, results: list[dict], cleaned_response: str = "") -> str:
