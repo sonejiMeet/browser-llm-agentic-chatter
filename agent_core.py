@@ -106,9 +106,7 @@ def extract_hermes_user_message(messages: list[dict]) -> tuple[str, str]:
         or user_content.startswith("User:")
         or "\nAssistant:" in user_content
     ):
-        # Strip everything from the first "Assistant:" marker onward
-        user_content = re.split(r"\nAssistant:", user_content)[0]
-        # Then extract the last "User:" segment if any
+        # Split on User: markers, take the last one
         parts = re.split(r"(?:^|\n)(?=User:\s?)", user_content)
         last_user = None
         for p in parts:
@@ -116,9 +114,12 @@ def extract_hermes_user_message(messages: list[dict]) -> tuple[str, str]:
             if p.startswith("User:"):
                 last_user = p[5:].strip()
         if last_user:
+            # Strip any trailing Assistant: text within the segment
+            last_user = re.split(r"\nAssistant:", last_user)[0].strip()
             user_content = last_user
-        else:
-            user_content = user_content.strip()
+        elif "\nAssistant:" in user_content:
+            # No User: markers found, but Assistant: text exists — strip it
+            user_content = re.split(r"\nAssistant:", user_content)[0].strip()
 
     # Redact any absolute paths / usernames that snuck into the task text
     user_content = redact_text(user_content.strip())
