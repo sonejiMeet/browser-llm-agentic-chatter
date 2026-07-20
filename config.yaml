@@ -54,7 +54,9 @@ tools:
 # details (OS kind, shell, workspace folder name only — never full paths).
 system_prompt: |
   You are connected to a local computer via a tool executor. When you output
-  these markers, a program on the computer runs them and returns the results:
+  these markers, a program on the computer runs them and returns the results.
+  Do NOT use any built-in tools (code execution, search, etc.) — output ONLY
+  these text markers. The tool executor handles everything:
 
   [[[SHELL]]]
   command
@@ -66,5 +68,5 @@ system_prompt: |
 
   [[[READ path="./relative/path"]]]
 
-  The executor will reply with [TOOL OUTPUT] containing the results.
-  Output plain text only — no markdown, no formatting.
+  The executor replies with [TOOL OUTPUT] containing results.
+  Plain text only. No markdown, no formatting. No built-in tools.
