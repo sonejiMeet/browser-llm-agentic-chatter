@@ -87,19 +87,19 @@ class ToolExecutor:
         calls: list[tuple[int, str, tuple]] = []
 
         for match in re.finditer(
-            r"\[\[\[SHELL\]\]\]\s*\n?(.*?)\[\[\[END\]\]\]", llm_response, re.DOTALL
+            r"\[\[\[SHELL\]{2,}\s*\n?(.*?)\[\[\[END\]{2,}", llm_response, re.DOTALL
         ):
             calls.append((match.start(), "shell", (match.group(1).strip(),)))
 
         for match in re.finditer(
-            r'\[\[\[FILE\s+path=["\']?(.*?)["\']?\]\]\]\s*\n?(.*?)\[\[\[END\]\]\]',
+            r'\[\[\[FILE\s+path=["\']?(.*?)["\']?\]{2,}\s*\n?(.*?)\[\[\[END\]{2,}',
             llm_response,
             re.DOTALL,
         ):
             calls.append((match.start(), "file", (match.group(1).strip(), match.group(2))))
 
         for match in re.finditer(
-            r'\[\[\[READ\s+path=["\']?(.*?)["\']?\]\]\]', llm_response
+            r'\[\[\[READ\s+path=["\']?(.*?)["\']?\]{2,}', llm_response
         ):
             calls.append((match.start(), "read", (match.group(1).strip(),)))
 
@@ -304,7 +304,7 @@ class ToolExecutor:
             # Marker capture sometimes keeps a leading newline — keep content as-is
             pass
         # Drop trailing [[[END]]] leakage if model botched markers
-        content = re.sub(r"\n?\[\[\[END\]\]\]\s*$", "", content)
+        content = re.sub(r"\n?\[\[\[END\]{2,}\s*$", "", content)
 
         p = Path(path_str).expanduser()
         if not p.is_absolute():

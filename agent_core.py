@@ -34,14 +34,14 @@ def clean_llm_text(text: str) -> str:
     """Strip tool markers and TASK_COMPLETE for human/Hermes display."""
     if not text:
         return ""
-    clean = re.sub(r"\[\[\[SHELL\]\]\].*?\[\[\[END\]\]\]", "", text, flags=re.DOTALL)
+    clean = re.sub(r"\[\[\[SHELL\]{2,}.*?\[\[\[END\]{2,}", "", text, flags=re.DOTALL)
     clean = re.sub(
-        r'\[\[\[FILE\s+path=["\']?.*?["\']?\]\]\].*?\[\[\[END\]\]\]',
+        r'\[\[\[FILE\s+path=["\']?.*?["\']?\]{2,}.*?\[\[\[END\]{2,}',
         "",
         clean,
         flags=re.DOTALL,
     )
-    clean = re.sub(r'\[\[\[READ\s+path=["\']?.*?["\']?\]\]\]', "", clean)
+    clean = re.sub(r'\[\[\[READ\s+path=["\']?.*?["\']?\]{2,}', "", clean)
     clean = re.sub(r"\bTASK_COMPLETE\b", "", clean)
     clean = re.sub(r"\n{3,}", "\n\n", clean)
     return clean.strip()
