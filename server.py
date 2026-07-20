@@ -105,11 +105,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         print(f"[response] {response[:120].replace(chr(10), ' ')}...")
-
-        if stream:
-            self._stream_response(model_req, response)
-        else:
-            self._json_response(model_req, response)
+        self._json_response(model_req, response)
         _busy.release()
 
     def do_GET(self):
