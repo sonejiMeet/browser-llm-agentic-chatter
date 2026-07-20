@@ -228,8 +228,10 @@ class AgentHandler(BaseHTTPRequestHandler):
         print(f"\n[request] model={model_req} stream={stream}")
         print(f"  user: {user_content[:120].replace(chr(10), ' ')}...")
 
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
         # Dedup: Hermes sends stream then non-stream for the same prompt.
-        # Return the cached response instead of hitting the browser LLM twice.
         global _last_request
         now = time.time()
         if user_content == _last_request[0] and (now - _last_request[1]) < 30:
@@ -239,9 +241,6 @@ class AgentHandler(BaseHTTPRequestHandler):
             else:
                 self._send_cached(chat_id, model_req, created, _last_request[2])
             return
-
-        chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        created = int(time.time())
 
         if stream:
             self._handle_stream(chat_id, model_req, created, user_content, "")
