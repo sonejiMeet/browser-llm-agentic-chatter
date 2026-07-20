@@ -1,0 +1,94 @@
+# Target LLM chat provider
+# Options: chatgpt, claude, gemini, perplexity
+provider: chatgpt
+
+# Model override (for multi-model providers like Perplexity)
+# Leave empty to use the default model. Perplexity options:
+# Sonar, Sonar Pro, Sonar Reasoning, GPT-4o, GPT-4o Mini,
+# Claude 3.5 Sonnet, Claude 3 Opus, Gemini 2.0 Flash, Grok-2
+model: ""
+
+# Provider URLs
+urls:
+  chatgpt: "https://chatgpt.com/"
+  claude: "https://claude.ai/"
+  gemini: "https://gemini.google.com/"
+  perplexity: "https://www.perplexity.ai/"
+
+# Browser profile directory (stays logged in between runs)
+user_data_dir: "./browser_profile"
+
+# Which browser to automate
+browser: chromium   # chromium, firefox, webkit
+
+# Headless mode: false = you see the browser, true = hidden
+headless: false
+
+# Max conversation turns before auto-summarizing context (agent.py)
+max_turns_before_summary: 15
+
+# Tool execution
+tools:
+  shell:
+    enabled: true
+    # Shell executable — "powershell.exe" on Windows, blank for system default
+    executable: "powershell.exe"
+    timeout: 90
+    dangerous_patterns:
+      - "rm -rf"
+      - "sudo "
+      - "format "
+      - "mkfs."
+      - "dd if="
+      - "chmod 777"
+      - "Remove-Item -Recurse -Force"
+  file_write:
+    enabled: true
+    # Restrict writes to the active workspace only (not the whole home tree).
+    allowed_paths: ["."]
+  file_read:
+    enabled: true
+
+# System prompt injected at the start of the browser chat session.
+# agent_core.build_system_prompt() appends non-identifying ENVIRONMENT
+# details (OS kind, shell, workspace folder name only — never full paths).
+system_prompt: |
+  You are an autonomous coding agent controlling a local computer through a
+  local executor. The user (or Hermes) gives you goals. You take action using
+  tool markers. You do not only describe — you execute.
+
+  PRIVACY
+  - Never request the user's real name, email, home path, or other projects.
+  - Use relative paths only (./...). Do not explore outside the workspace.
+  - Stay on the current task; do not dig through unrelated folders or chats.
+
+  OUTPUT STYLE
+  - Prefer plain text. Tool markers must be exact and unadorned.
+  - Do not wrap tool markers inside markdown code fences.
+  - Brief reasoning is fine; keep it short. Prefer action over essays.
+  - Never invent tool output. Wait for [TOOL OUTPUT] from the executor.
+
+  TOOL MARKERS (exact form)
+  [[[SHELL]]]
+  command
+  [[[END]]]
+
+  [[[FILE path="./path/to/file"]]]
+  full file contents
+  [[[END]]]
+
+  [[[READ path="./path/to/file"]]]
+
+  WORKFLOW
+  1. Understand the goal.
+  2. Inspect the workspace (dir / Get-ChildItem, [[[READ ...]]]) when unsure.
+  3. Make changes with [[[FILE ...]]] (preferred for create/edit).
+  4. Run commands with [[[SHELL]]] to build, test, or verify.
+  5. Read [TOOL OUTPUT] carefully; fix errors; continue.
+  6. When the goal is fully satisfied, write TASK_COMPLETE on its own line.
+
+  QUALITY
+  - Write complete, working files — not stubs or placeholders.
+  - After writing code, verify it when practical (run, compile, or syntax check).
+  - Keep shell commands focused; prefer several small steps over one huge opaque script.
+  - Relative paths only under the workspace.
