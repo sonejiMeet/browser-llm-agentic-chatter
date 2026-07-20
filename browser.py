@@ -297,13 +297,6 @@ class BrowserBridge:
         await self._focus_input()
         await self._clear_input()
 
-        # Track response count so wait_for_response can verify new content
-        try:
-            els = await self._page.query_selector_all(self.selectors["response"])
-            self._prev_response_count = len(els)
-        except Exception:
-            self._prev_response_count = -1
-
         # Normalize line endings
         text = text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -388,14 +381,9 @@ class BrowserBridge:
         return "[No response found]"
 
     async def _read_last_response(self) -> str:
-        """Read the last response element. If the count hasn't increased
-        since send_message, the LLM didn't produce a new response."""
         try:
             messages = await self._page.query_selector_all(self.selectors["response"])
             if messages:
-                prev = getattr(self, "_prev_response_count", -1)
-                if prev >= 0 and len(messages) <= prev:
-                    return "[No new response — LLM may have used built-in tools instead of text]"
                 last = messages[-1]
                 text = await last.inner_text()
                 return text.strip()
