@@ -159,7 +159,7 @@ class ToolExecutor:
         sections: list[str] = []
 
         if results:
-            sections.append("## Agent Actions")
+            sections.append("Agent Actions:")
             for i, r in enumerate(results, 1):
                 if r["type"] == "shell":
                     cmd = r.get("command", "")
@@ -205,7 +205,7 @@ class ToolExecutor:
 
         # Session change log summary (git-like)
         if self.change_log:
-            sections.append("\n## Change Log")
+            sections.append("\nChange Log:")
             for entry in self.change_log[-30:]:
                 kind = entry.get("kind", "?")
                 path = entry.get("path", "")
@@ -222,7 +222,7 @@ class ToolExecutor:
                     sections.append(f"* {kind} {path}")
 
         if cleaned_response and cleaned_response.strip():
-            sections.append("\n## Assistant\n")
+            sections.append("\n")
             sections.append(cleaned_response.strip())
 
         return "\n".join(sections).strip()
