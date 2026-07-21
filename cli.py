@@ -35,7 +35,7 @@ from prompt_toolkit.shortcuts import clear as clear_screen
 from browser import BrowserBridge, PERPLEXITY_MODELS
 from tools import ToolExecutor
 from session import Session
-from agent_core import AgentLoop, clean_llm_text
+from agent_core import AgentLoop
 
 console = Console()
 
@@ -122,8 +122,6 @@ class AgentShell:
     async def _process_message(self, text: str):
         self.session.add_user(text)
 
-        final_text = ""
-
         async for event in self.agent.run_turn(text):
             if event.kind == "status":
                 console.print(f"    [dim italic]{event.text}[/]")
@@ -181,7 +179,6 @@ class AgentShell:
                 console.print(f"\n[bold red]✗ ERROR:[/] {event.text}")
 
             elif event.kind == "done":
-                final_text = event.text
                 if self.tools.change_log:
                     lines: list[str] = []
                     for e in self.tools.change_log:
@@ -199,18 +196,6 @@ class AgentShell:
                         box=box.ROUNDED,
                         padding=(0, 1),
                     ))
-
-        # Fallback
-        if final_text and not self.session.last_assistant():
-            cleaned = clean_llm_text(final_text)
-            if cleaned.strip():
-                console.print()
-                console.print(Panel(
-                    Markdown(cleaned),
-                    border_style="green",
-                    box=box.ROUNDED,
-                    padding=(0, 2),
-                ))
 
     async def _handle_command(self, raw: str) -> bool:
         """Return True if the shell should exit."""

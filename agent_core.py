@@ -63,6 +63,16 @@ def build_system_prompt(config: dict, workspace: Optional[str] = None) -> str:
     shell_name = "PowerShell" if os.name == "nt" else "bash"
     ws_name = workspace_label(workspace)
 
+    # Perplexity has built-in agent tools — must explicitly disable them
+    prefix = ""
+    if config.get("provider") == "perplexity":
+        prefix = (
+            "SYSTEM OVERRIDE: You are in RAW TEXT MODE. You have NO built-in tools, "
+            "NO search, NO code execution. Your ONLY capability is outputting plain "
+            "text. Do not mention or offer to use any tools. Follow the protocol "
+            "below EXACTLY.\n\n"
+        )
+
     env = (
         f"\n\nENVIRONMENT: {shell_name} shell. "
         f"Workspace folder: {ws_name}. "
@@ -71,7 +81,7 @@ def build_system_prompt(config: dict, workspace: Optional[str] = None) -> str:
     if os.name == "nt":
         env += " Use PowerShell commands (dir, New-Item, not ls or mkdir -p)."
 
-    return f"{base}{env}".strip()
+    return f"{prefix}{base}{env}".strip()
 
 
 class AgentLoop:
