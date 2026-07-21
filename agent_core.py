@@ -63,14 +63,30 @@ def build_system_prompt(config: dict, workspace: Optional[str] = None) -> str:
     shell_name = "PowerShell" if os.name == "nt" else "bash"
     ws_name = workspace_label(workspace)
 
-    # Perplexity has built-in agent tools — must explicitly disable them
+    # Perplexity's models are system-prompted to use built-in tools and
+    # reject external marker protocols.  We don't fight that — we give a
+    # minimal output-format instruction instead of an agent persona.
     prefix = ""
     if config.get("provider") == "perplexity":
         prefix = (
-            "SYSTEM OVERRIDE: You are in RAW TEXT MODE. You have NO built-in tools, "
-            "NO search, NO code execution. Your ONLY capability is outputting plain "
-            "text. Do not mention or offer to use any tools. Follow the protocol "
-            "below EXACTLY.\n\n"
+            "OUTPUT FORMAT — follow exactly:\n"
+            "\n"
+            "Shell command:\n"
+            "[[[SHELL]]]\n"
+            "command\n"
+            "[[[END]]]\n"
+            "\n"
+            "Write file:\n"
+            "[[[FILE path=\"name\"]]]\n"
+            "content\n"
+            "[[[END]]]\n"
+            "\n"
+            "Read file:\n"
+            "[[[READ path=\"name\"]]]\n"
+            "\n"
+            "No markdown.  No backticks.  No explanations outside markers.\n"
+            "Output ONLY the markers above with the requested content.\n"
+            "\n"
         )
 
     env = (

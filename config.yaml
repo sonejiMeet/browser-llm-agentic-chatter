@@ -13,7 +13,7 @@ urls:
   chatgpt: "https://chatgpt.com/"
   claude: "https://claude.ai/"
   gemini: "https://gemini.google.com/"
-  perplexity: "https://www.perplexity.ai/"
+  perplexity: "https://www.perplexity.ai/?focus=writing"
 
 # Browser profile directory (stays logged in between runs)
 user_data_dir: "./browser_profile"

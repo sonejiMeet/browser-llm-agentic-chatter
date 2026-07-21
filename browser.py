@@ -57,6 +57,14 @@ PERPLEXITY_MODELS = [
     "Grok-2",
 ]
 
+# Perplexity Pro-search toggle — must disable so LLM doesn't see built-in tools
+PERPLEXITY_PRO_SELECTOR = (
+    'button:has-text("Pro"), '
+    '[data-testid="pro-toggle"], '
+    'label:has-text("Pro"), '
+    'div[role="switch"][aria-label*="Pro"]'
+)
+
 
 class BrowserBridge:
     def __init__(self, config: dict):
@@ -155,6 +163,63 @@ class BrowserBridge:
             return False
         except Exception as e:
             print(f"  [model] Selection failed: {e}")
+            return False
+
+    async def _response_text_stable(self, timeout: float = 2.0) -> bool:
+        """Return True if the last response element's text has grown beyond
+        its initial state AND stopped changing for *timeout* seconds.
+        Old/stale text that never changed is NOT considered stable."""
+        resp_sel = self.selectors["response"]
+        deadline = time.time() + timeout
+        last = ""
+        stable_since = time.time()
+        initial_len = -1  # -1 = not yet captured
+        while time.time() < deadline:
+            try:
+                msgs = await self._page.query_selector_all(resp_sel)
+                if not msgs:
+                    await asyncio.sleep(0.2)
+                    continue
+                text = await msgs[-1].evaluate("el => el.textContent")
+                if initial_len < 0:
+                    initial_len = len(text)
+                if text == last:
+                    if len(text) >= initial_len and time.time() - stable_since >= timeout:
+                        return True
+                else:
+                    last = text
+                    stable_since = time.time()
+            except Exception:
+                pass
+            await asyncio.sleep(0.15)
+        return len(last) >= initial_len  # grew or stayed same? accept. shrunk? reject.
+
+    async def disable_pro_search(self) -> bool:
+        """Turn off Perplexity Pro search toggle if it's on.
+        Pro search enables built-in tools that confuse our marker protocol."""
+        if self.provider != "perplexity":
+            return False
+        try:
+            # Pro toggle is a button/switch — try common selectors
+            for sel in (
+                'button[aria-label*="Pro"]',
+                'button:has-text("Pro")',
+                '[data-testid="pro-toggle"]',
+                'label:has-text("Pro")',
+            ):
+                btn = await self._page.query_selector(sel)
+                if btn:
+                    # Check if it's already off (aria-checked="false")
+                    checked = await btn.get_attribute("aria-checked")
+                    if checked == "false":
+                        return True  # already off
+                    await btn.click()
+                    await asyncio.sleep(0.3)
+                    print("  [perplexity] Pro search disabled")
+                    return True
+            return False
+        except Exception as e:
+            print(f"  [perplexity] Pro toggle failed: {e}")
             return False
 
     async def new_chat(self):
@@ -320,31 +385,84 @@ class BrowserBridge:
             await self._page.keyboard.press("Enter")
 
     async def wait_for_response(self, timeout_seconds: int = 300) -> str:
-        """Wait for generation to finish. Uses Playwright's native wait_for_selector
-        to watch for the stop button to appear-then-disappear — zero polling overhead.
-        Falls back to fast text-stability check if no stop button exists."""
+        """Wait for generation to finish. After the stop button disappears,
+        confirms the Copy button is visible — thinking models pause/restart
+        generation (stop button flickers), but Copy only appears when the
+        full response including all thinking blocks is fully rendered."""
         stop_sel = self.selectors.get("stop_button")
+        copy_sel = self.selectors.get("copy_btn")
         deadline = time.time() + timeout_seconds
 
+        if stop_sel and copy_sel:
+            # Wait for initial generation to start
+            saw_stop = False
+            try:
+                await self._page.wait_for_selector(stop_sel, state="visible", timeout=8000)
+                saw_stop = True
+            except Exception:
+                pass
+
+            # Loop: stop-disappear → check Copy → if stop reappears, loop again
+            while time.time() < deadline:
+                # Wait for stop button to disappear
+                try:
+                    remaining = max(1, deadline - time.time())
+                    await self._page.wait_for_selector(
+                        stop_sel, state="hidden", timeout=remaining * 1000
+                    )
+                except Exception:
+                    pass
+
+                # Copy button visible? → full response rendered.
+                # Still need stability: thinking models sometimes show
+                # Copy briefly between blocks, then hide it again.
+                try:
+                    btn = await self._page.query_selector(copy_sel)
+                    if btn and await btn.is_visible():
+                        await asyncio.sleep(0.2)
+                        # Verify text is stable before returning
+                        if await self._response_text_stable(timeout=2.0):
+                            return await self._read_last_response()
+                        # Not stable — Copy appeared early, keep looping
+                except Exception:
+                    pass
+
+                # Not visible yet — brief settle, then check if stop reappeared
+                await asyncio.sleep(0.3)
+                try:
+                    btn = await self._page.query_selector(stop_sel)
+                    if btn and await btn.is_visible():
+                        saw_stop = True
+                        continue  # more thinking/response → loop again
+                except Exception:
+                    pass
+
+                # Neither stop nor copy visible.
+                # If we never saw generation start, don't assume done — keep waiting.
+                if not saw_stop:
+                    await asyncio.sleep(0.5)
+                    continue
+                await asyncio.sleep(0.2)
+                return await self._read_last_response()
+
+            return await self._read_last_response()
+
+        # Fallback: text-stability polling (no stop/copy selectors available)
         if stop_sel:
-            # Wait for stop button to appear (generation started)
             try:
                 await self._page.wait_for_selector(stop_sel, state="visible", timeout=8000)
             except Exception:
-                pass  # may not appear, continue
-
-            # Wait for stop button to DISAPPEAR (generation done) — native, no polling
+                pass
             try:
                 remaining = max(1, deadline - time.time())
                 await self._page.wait_for_selector(
                     stop_sel, state="hidden", timeout=remaining * 1000
                 )
-                await asyncio.sleep(0.2)  # settle
+                await asyncio.sleep(0.2)
                 return await self._read_last_response()
             except Exception:
-                pass  # button didn't hide in time, fall through
+                pass
 
-        # Fallback: fast text-stability polling (for providers without stop button)
         try:
             before = await self._page.inner_text("body")
         except Exception:

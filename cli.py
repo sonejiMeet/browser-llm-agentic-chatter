@@ -79,6 +79,9 @@ class AgentShell:
         if model:
             await self.bridge.select_model(model)
 
+        # Perplexity: kill Pro search so LLM doesn't see built-in tools
+        await self.bridge.disable_pro_search()
+
         self.agent = AgentLoop(self.bridge, self.tools, self.config)
         console.print("[dim]Priming system prompt...[/]")
         init_resp = await self.agent.prime()
