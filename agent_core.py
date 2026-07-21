@@ -1,8 +1,8 @@
 """
-agent_core.py — Shared agent loop used by server.py, cli.py, and agent.py.
+agent_core.py — Shared agent loop used by cli.py and agent.py.
 
-Yields structured events so callers (especially the Hermes-facing server)
-can stream git-like change logs, running commands, and cleaned chat text.
+Yields structured events so callers can stream git-like change logs,
+running commands, and cleaned chat text.
 
 Privacy: nothing sent to the browser chat LLM includes the user's name,
 home directory, unrelated local projects, or prior local chat history.
@@ -31,7 +31,7 @@ class AgentEvent:
 
 
 def clean_llm_text(text: str) -> str:
-    """Strip tool markers and TASK_COMPLETE for human/Hermes display."""
+    """Strip tool markers and TASK_COMPLETE for display."""
     if not text:
         return ""
     clean = re.sub(r"\[\[\[SHELL\]{2,}.*?\[\[\[END\]{2,}", "", text, flags=re.DOTALL)
@@ -64,79 +64,6 @@ def build_system_prompt(config: dict, workspace: Optional[str] = None) -> str:
         env += " Use PowerShell commands (dir, New-Item, not ls or mkdir -p)."
 
     return f"{base}{env}".strip()
-
-
-def extract_hermes_user_message(messages: list[dict]) -> tuple[str, str]:
-    """Extract only the current user task for the browser LLM.
-
-    Intentionally drops:
-      - Hermes/system developer prompts (may include local paths, identity)
-      - Multi-turn chat history (local conversations)
-      - Embedded Assistant/User history blobs beyond the latest user turn
-
-    Returns (user_task, extra_context) where extra_context is always empty
-    so private client context is never forwarded to the cloud chat.
-    """
-    user_parts: list[str] = []
-
-    for m in messages:
-        role = (m.get("role") or "").lower()
-        content = m.get("content") or ""
-        if isinstance(content, list):
-            texts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    texts.append(part.get("text", ""))
-                elif isinstance(part, str):
-                    texts.append(part)
-            content = "\n".join(texts)
-        if not isinstance(content, str):
-            content = str(content)
-
-        # Ignore system/developer — do not forward to browser chat
-        if role == "user":
-            user_parts.append(content.strip())
-
-    user_content = user_parts[-1] if user_parts else ""
-
-    # Strip Hermes system messages ([System: ...]) — session carryover noise
-    if user_content.startswith("[System:"):
-        idx = user_content.find("]")
-        if idx > 0:
-            user_content = user_content[idx + 1:].strip()
-    # Also strip any leading [System: ...] block
-    user_content = re.sub(r"^\[System:.*?\]\s*", "", user_content, flags=re.DOTALL)
-
-    if not user_content:
-        return "hi", ""  # fallback — don't send empty to LLM
-
-    # Hermes sometimes embeds multi-turn as "User: ...\n\nAssistant: ...\n\nUser: ..."
-    # Keep ONLY the last User: segment — never prior turns or assistant text.
-    if user_content and (
-        "\nUser:" in user_content
-        or user_content.startswith("User:")
-        or "\nAssistant:" in user_content
-    ):
-        # Split on User: markers, take the last one
-        parts = re.split(r"(?:^|\n)(?=User:\s?)", user_content)
-        last_user = None
-        for p in parts:
-            p = p.strip()
-            if p.startswith("User:"):
-                last_user = p[5:].strip()
-        if last_user:
-            # Strip any trailing Assistant: text within the segment
-            last_user = re.split(r"\nAssistant:", last_user)[0].strip()
-            user_content = last_user
-        elif "\nAssistant:" in user_content:
-            # No User: markers found, but Assistant: text exists — strip it
-            user_content = re.split(r"\nAssistant:", user_content)[0].strip()
-
-    # Redact any absolute paths / usernames that snuck into the task text
-    user_content = redact_text(user_content.strip())
-
-    # Never forward extra client context (history, system, projects)
-    return user_content, ""
 
 
 class AgentLoop:
@@ -179,7 +106,7 @@ class AgentLoop:
         all_results: list[dict] = []
         last_raw = ""
 
-        # Privacy: never attach Hermes history / system / unrelated projects
+        # Only forward the current task — no prior history or system context
         outbound = redact_text(user_message or "", workspace=self.tools.workspace)
 
         yield AgentEvent("status", "Sending request to browser LLM...")

@@ -9,7 +9,6 @@ Usage:
     python agent.py --provider claude "Refactor all Python files to use pathlib"
 
 For interactive REPL:  python cli.py
-For Hermes API:        python server.py
 """
 
 from __future__ import annotations

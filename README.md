@@ -1,137 +1,128 @@
 # Browser LLM Agent
 
-Use your ChatGPT Plus / Claude Pro / Gemini Advanced **subscription** as an
-autonomous AI agent — no API key needed. The agent controls a real browser,
-pastes into the web chat, reads responses, executes commands on your computer,
-and feeds the output back.
+Drive web-based LLMs (ChatGPT, Claude, Gemini, Perplexity) as autonomous coding agents — **no API key needed**. Uses your existing browser session/subscription via Playwright.
 
-```
-You / Hermes → server → browser chat LLM → tool markers → local tools
-                ↑______________ agent activity stream ______________|
-```
+The agent reads your task, controls the chat LLM through text markers, executes shell commands and file operations locally, and feeds results back. It loops autonomously until the task is done.
 
-## Quick start
+## Quick Start
 
 ```bash
 pip install -r requirements.txt
-python -m playwright install chromium
-
-# Interactive terminal
-python cli.py
-
-# Single task
-python agent.py "Create a Flask app with a /health endpoint in ./myapp/"
-
-# OpenAI-compatible server for Hermes
-python server.py
+playwright install chromium
 ```
 
-First run: log into ChatGPT/Claude in the browser window. Session is saved to
-`./browser_profile/`.
-
-## Hermes integration
+### Interactive REPL
 
 ```bash
-python server.py --port 8765
-
-hermes config set model.provider custom
-hermes config set model.base_url http://localhost:8765/v1
-hermes config set model.api_key noop
+python cli.py
 ```
 
-The server streams **agent-style activity** back to Hermes:
+Rich-powered terminal UI with markdown rendering, syntax highlighting, and tool execution panels.
 
-- status (`Waiting for LLM…`, `Feeding tool output…`)
-- shell commands as they run (`$ Get-ChildItem`)
-- command output
-- file writes with **unified diffs** (git-like change log)
-- cleaned assistant text (tool markers stripped)
-- final report with full change log
-
-### What Hermes sees (example)
-
-```text
-*Waiting for LLM response (round 1)*
-
-I'll create the app structure.
-
-*Writing `myapp/app.py`...*
-```diff
---- a/myapp/app.py
-+++ b/myapp/app.py
-@@ -0,0 +1,8 @@
-+from flask import Flask
-+app = Flask(__name__)
-...
+```bash
+python cli.py --provider claude
+python cli.py --provider perplexity --model "GPT-4o"
 ```
 
-```
-$ python -c "import myapp.app"
-```
+### Single-shot
 
-## Agent Actions
-### [1] file_write ...
-### [2] shell ...
-## Change Log
-+ created  myapp/app.py
-$ python -c "import myapp.app"
-## Assistant
-Done — Flask app is ready.
+```bash
+python agent.py "Build a Flask TODO app in ./myapp/"
+python agent.py --provider claude "Refactor all Python files to use pathlib"
 ```
 
-## Architecture
+## How It Works
 
-| File | Role |
-|------|------|
-| `server.py` | OpenAI-compatible API for Hermes (streaming agent events) |
-| `cli.py` | Interactive rich terminal REPL |
-| `agent.py` | Single-shot autonomous task runner |
-| `agent_core.py` | Shared agent loop + full system prompt + Hermes message parsing |
-| `browser.py` | Playwright bridge — **clipboard paste** (not char-by-char typing) |
-| `tools.py` | Shell / file read-write + unified diffs + change log |
-| `session.py` | CLI conversation memory |
-| `config.yaml` | Provider, tools, system prompt |
-
-## Speed notes
-
-- Messages are **pasted** via clipboard into the chat input (instant for long
-  system prompts and tool feedback). Falls back to chunked typing if paste fails.
-- Response wait polls the stop button at ~350ms intervals (not multi-second sleeps).
-- Tool rounds stream to Hermes as they happen instead of waiting for the full turn.
-
-## Providers
-
-```yaml
-provider: chatgpt    # or claude, gemini, perplexity
-headless: false
-model: ""            # Perplexity multi-model only
-```
-
-## Tool format
+The agent types into the browser chat using Playwright. It sends a system prompt teaching the LLM a plain-text marker protocol:
 
 ```
 [[[SHELL]]]
-pip install flask
+dir
 [[[END]]]
 
-[[[FILE path="./app.py"]]]
-from flask import Flask
-app = Flask(__name__)
+[[[FILE path="./script.py"]]]
+print("hello")
 [[[END]]]
 
-[[[READ path="./app.py"]]]
+[[[READ path="./script.py"]]]
 ```
 
-The executor replies with:
+The agent parses responses, executes tools locally, and feeds `[TOOL OUTPUT]` back to the LLM. The loop continues until the LLM writes `TASK_COMPLETE`.
+
+### Indentation
+
+Inside `[[[FILE ...]]]` blocks, use `→` at line start for indentation:
 
 ```
-[TOOL OUTPUT]
-...
-[/TOOL OUTPUT]
+[[[FILE path="./script.py"]]]
+def greet():
+→print("hello")
+→→print("nested")
+[[[END]]]
 ```
 
-## Safety
+`→` = 4 spaces, `→→` = 8 spaces. The server converts these automatically.
 
-- Dangerous shell patterns are blocked (`rm -rf`, `Remove-Item -Recurse -Force`, …)
-- File writes restricted to `allowed_paths` in `config.yaml`
-- Browser profile is isolated from your daily browser
+## Configuration
+
+Edit `config.yaml`:
+
+```yaml
+provider: chatgpt        # chatgpt, claude, gemini, perplexity
+model: ""                # model override (for Perplexity)
+headless: false           # true = hidden browser
+
+tools:
+  shell:
+    enabled: true
+    executable: "powershell.exe"   # blank = system default
+    timeout: 90
+  file_write:
+    enabled: true
+    allowed_paths: ["."]           # restrict to workspace
+```
+
+## Project Structure
+
+```
+agent.py          Single-shot mode
+cli.py            Interactive Rich REPL
+agent_core.py     Agent loop, event system, system prompt builder
+browser.py        Playwright wrapper (type, submit, read responses)
+tools.py          Shell execution, file read/write, change tracking
+privacy.py        Redacts local paths/identity before sending to cloud
+session.py        Conversation history and auto-summarization
+config.yaml       Provider, model, tool, and prompt configuration
+```
+
+## Providers
+
+| Provider | URL | Notes |
+|----------|-----|-------|
+| ChatGPT | chatgpt.com | Default. GPT-4o. |
+| Claude | claude.ai | Sonnet/Opus. |
+| Gemini | gemini.google.com | Google's models. |
+| Perplexity | perplexity.ai | Multi-model: GPT-4o, Sonar, Claude, Grok. Use `--model`. |
+
+Login in the browser window on first run. The profile persists in `./browser_profile/`.
+
+## CLI Commands
+
+Inside the REPL (`python cli.py`):
+
+| Command | Action |
+|---------|--------|
+| `/help` | Show commands |
+| `/clear` | Clear session and screen |
+| `/history` | Show conversation history |
+| `/changes` | Show file/shell change log |
+| `/provider` | Show current provider/model |
+| `/exit` | Quit |
+
+`Alt+Enter` for multi-line input.
+
+## Requirements
+
+- Python 3.11+
+- Playwright (Chromium)
+- A subscription to at least one supported LLM provider

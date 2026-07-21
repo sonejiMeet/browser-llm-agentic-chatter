@@ -1,7 +1,7 @@
 """
 tools.py - Local tool execution.
 Runs shell commands, reads/writes files. Returns structured results with
-git-like change logs for agent feedback to Hermes / the chat LLM.
+git-like change logs for agent feedback.
 
 Outputs destined for the browser chat LLM are privacy-redacted (no home
 paths, usernames, or absolute local identity).
@@ -173,7 +173,7 @@ class ToolExecutor:
         return "\n".join(lines)
 
     def format_agent_report(self, results: list[dict], cleaned_response: str = "") -> str:
-        """Rich report for Hermes / external clients — agent-style activity log."""
+        """Rich report for external display — agent-style activity log."""
         sections: list[str] = []
 
         if results:
