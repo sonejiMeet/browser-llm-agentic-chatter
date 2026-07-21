@@ -31,10 +31,18 @@ class AgentEvent:
 
 
 def clean_llm_text(text: str) -> str:
-    """Strip tool markers and TASK_COMPLETE for display."""
+    """Strip tool markers, markdown, and TASK_COMPLETE for display."""
     if not text:
         return ""
-    clean = re.sub(r"\[\[\[SHELL\]{2,}.*?\[\[\[END\]{2,}", "", text, flags=re.DOTALL)
+    # Strip fenced code blocks — keep content, remove fences+lang
+    clean = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
+    # Strip inline backticks
+    clean = re.sub(r"`([^`\n]+)`", r"\1", clean)
+    # Strip bold/italic
+    clean = re.sub(r"\*\*(.+?)\*\*", r"\1", clean)
+    clean = re.sub(r"\*([^*\n]+)\*", r"\1", clean)
+    # Strip tool markers
+    clean = re.sub(r"\[\[\[SHELL\]{2,}.*?\[\[\[END\]{2,}", "", clean, flags=re.DOTALL)
     clean = re.sub(
         r'\[\[\[FILE\s+path=["\']?.*?["\']?\]{2,}.*?\[\[\[END\]{2,}',
         "",
@@ -125,11 +133,16 @@ class AgentLoop:
                 return
 
             last_raw = response or ""
+            # Strip markdown fences that could hide tool markers
+            parseable = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", last_raw, flags=re.DOTALL)
+            parseable = re.sub(r"`([^`\n]+)`", r"\1", parseable)
+            parseable = re.sub(r"\*\*(.+?)\*\*", r"\1", parseable)
+            parseable = re.sub(r"\*([^*\n]+)\*", r"\1", parseable)
             cleaned = clean_llm_text(last_raw)
             if cleaned:
                 yield AgentEvent("response", cleaned, {"round": round_i + 1})
 
-            results = self.tools.execute_tool_calls(last_raw)
+            results = self.tools.execute_tool_calls(parseable)
 
             if not results:
                 final_clean = cleaned or last_raw.strip()

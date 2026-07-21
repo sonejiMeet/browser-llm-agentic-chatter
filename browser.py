@@ -18,6 +18,7 @@ SELECTORS = {
         "response": "div[data-message-author-role='assistant'], div.agent-turn",
         "stop_button": 'button[data-testid="stop-button"], button[aria-label="Stop generating"]',
         "new_chat": 'a[href="/"], button:has-text("New chat"), a:has-text("New chat")',
+        "copy_btn": 'button[aria-label="Copy"]',
     },
     "claude": {
         "input": 'div[contenteditable="true"].ProseMirror, div[contenteditable="true"]',
@@ -25,6 +26,7 @@ SELECTORS = {
         "response": "div.font-claude-message, div[data-is-streaming], div.assistant-message",
         "stop_button": 'button[aria-label="Stop"], button[aria-label="Stop response"]',
         "new_chat": 'button:has-text("New chat"), a:has-text("Start new chat")',
+        "copy_btn": 'button[aria-label="Copy response"], button[aria-label="Copy"]',
     },
     "gemini": {
         "input": 'div[contenteditable="true"], rich-textarea div[contenteditable="true"]',
@@ -32,6 +34,7 @@ SELECTORS = {
         "response": "model-response, .model-response-text, message-content",
         "stop_button": 'button[aria-label="Stop"]',
         "new_chat": 'button:has-text("New chat")',
+        "copy_btn": 'button[aria-label="Copy"], button[data-action="copy"]',
     },
     "perplexity": {
         "input": 'textarea[placeholder*="Ask"], textarea[placeholder*="ask"], div[contenteditable="true"]',
@@ -42,6 +45,7 @@ SELECTORS = {
         "model_btn": 'button:has-text("Sonar"), button:has-text("GPT"), button:has-text("Claude"), [data-testid="model-selector"]',
         "model_option": 'div[role="option"], div[role="menuitem"], button',
         "model_dropdown": 'div[role="listbox"], div[role="menu"]',
+        "copy_btn": 'button[aria-label="Copy"]',
     },
 }
 
@@ -368,12 +372,39 @@ class BrowserBridge:
         return await self._read_last_response()
 
     async def _read_last_response(self) -> str:
-        """Read last response preserving whitespace (indentation matters for code)."""
+        """Read the last assistant response via the Copy button.
+        Gets the raw markdown/text exactly as the LLM output it —
+        preserves indentation, code blocks, and formatting.
+        Falls back to textContent if copy fails."""
+        copy_sel = self.selectors.get("copy_btn")
+
+        # Method 1: click copy button → read clipboard
+        if copy_sel:
+            try:
+                text = await self._page.evaluate("""
+                    async (sel) => {
+                        const btns = [...document.querySelectorAll(sel)];
+                        if (!btns.length) return null;
+                        // Click the last copy button (belongs to last message)
+                        btns[btns.length - 1].click();
+                        await new Promise(r => setTimeout(r, 300));
+                        try {
+                            return await navigator.clipboard.readText();
+                        } catch (e) {
+                            return null;
+                        }
+                    }
+                """, copy_sel)
+                if text and text.strip():
+                    return text.strip()
+            except Exception:
+                pass
+
+        # Method 2: fallback — textContent from last response element
         try:
             messages = await self._page.query_selector_all(self.selectors["response"])
             if messages:
                 last = messages[-1]
-                # textContent preserves leading spaces/tabs (inner_text strips them)
                 text = await last.evaluate("el => el.textContent")
                 return text.strip()
         except Exception as e:
