@@ -23,6 +23,8 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 from rich import box
 
 from prompt_toolkit import PromptSession
@@ -41,6 +43,13 @@ PTK_STYLE = PTKStyle.from_dict({
     "prompt": "bold #00ff87",
 })
 
+# Tool icons for visual distinction
+_TOOL_ICONS = {
+    "shell": "⚡",
+    "file_write": "✎",
+    "file_read": "📖",
+}
+
 
 class AgentShell:
     def __init__(self, config: dict):
@@ -57,7 +66,7 @@ class AgentShell:
             f"Provider: [cyan]{self.config['provider']}[/]"
             + (f"  Model: [yellow]{self.config.get('model', 'default')}[/]"
                if self.config.get("model") else "")
-            + f"\nWorkspace: [dim]{Path.cwd().name}[/]  [dim](full path kept local)[/]"
+            + f"\nWorkspace: [dim]{Path.cwd().name}[/]"
             + f"\n/[bold cyan]help[/] for commands  /[bold red]exit[/] to quit",
             box=box.HEAVY, border_style="bright_blue",
         ))
@@ -71,7 +80,7 @@ class AgentShell:
             await self.bridge.select_model(model)
 
         self.agent = AgentLoop(self.bridge, self.tools, self.config)
-        console.print("[dim]Priming system prompt (fast paste)...[/]")
+        console.print("[dim]Priming system prompt...[/]")
         init_resp = await self.agent.prime()
         if init_resp:
             self.session.add_assistant(init_resp)
@@ -112,69 +121,95 @@ class AgentShell:
 
     async def _process_message(self, text: str):
         self.session.add_user(text)
-        console.print(Panel(text, title="You", border_style="cyan", box=box.ROUNDED))
 
         final_text = ""
+
         async for event in self.agent.run_turn(text):
             if event.kind == "status":
-                console.print(f"[dim]{event.text}[/]")
+                console.print(f"    [dim italic]{event.text}[/]")
+
             elif event.kind == "response":
                 self.session.add_assistant(event.text)
-                clean = event.text
-                if clean.strip():
+                clean = event.text.strip()
+                if clean:
+                    console.print()
                     console.print(Panel(
                         Markdown(clean),
-                        title="AI",
                         border_style="green",
                         box=box.ROUNDED,
+                        padding=(0, 2),
                     ))
+
             elif event.kind == "tool_start":
-                console.print(f"  [bold yellow]▶[/] {event.text}")
+                tool = event.data.get("tool", "tool")
+                icon = _TOOL_ICONS.get(tool, "▶")
+                console.print(f"\n  [bold yellow]{icon}[/] [bold]{event.text}[/]")
+
             elif event.kind == "tool_result":
                 lang = "powershell" if os.name == "nt" else "bash"
-                if event.data.get("tool") == "file_write":
+                tool = event.data.get("tool", "tool")
+                if tool == "file_write":
                     lang = "diff"
+                elif tool == "file_read":
+                    path = event.data.get("path", "")
+                    if path.endswith(".py"):
+                        lang = "python"
+                    elif any(path.endswith(e) for e in (".c", ".h", ".cpp", ".hpp")):
+                        lang = "c"
+
+                ok = event.data.get("ok", True)
                 output = event.text.strip()
-                preview = output[:400]
-                if len(output) > 400:
-                    preview += f"\n... ({len(output)} total chars)"
-                style = "red" if not event.data.get("ok", True) else "yellow"
+                preview = output[:1000]
+                if len(output) > 1000:
+                    preview += f"\n\n... [dim]({len(output)} total chars)[/]"
+
+                style = "red" if not ok else "green"
+                symbol = "✗" if not ok else "✓"
+                duration = event.data.get("duration_ms")
+                dur_str = f" [dim]{duration}ms[/]" if duration else ""
+
                 console.print(Panel(
                     Syntax(preview, lang, theme="monokai", word_wrap=True),
-                    title=f"[bold {style}]{'✗' if not event.data.get('ok', True) else '✓'} "
-                          f"{event.data.get('tool', 'tool')}[/]",
+                    title=f"[bold {style}]{symbol} {tool}[/]{dur_str}",
                     border_style=style,
                     box=box.ROUNDED,
+                    padding=(0, 1),
                 ))
-                self.session.add_tool(f"{event.data.get('tool')}: {output[:500]}")
+                self.session.add_tool(f"{tool}: {output[:500]}")
+
             elif event.kind == "error":
-                console.print(f"[bold red]ERROR:[/] {event.text}")
+                console.print(f"\n[bold red]✗ ERROR:[/] {event.text}")
+
             elif event.kind == "done":
                 final_text = event.text
                 if self.tools.change_log:
-                    lines = []
+                    lines: list[str] = []
                     for e in self.tools.change_log:
-                        kind = e.get("kind")
-                        if kind in ("create", "modify"):
-                            lines.append(f"{kind:8} {e.get('path')}")
+                        kind = e.get("kind", "?")
+                        if kind == "create":
+                            lines.append(f"  [green]+[/] created  {e.get('path', '?')}")
+                        elif kind == "modify":
+                            lines.append(f"  [yellow]~[/] modified {e.get('path', '?')}")
                         elif kind == "shell":
-                            lines.append(f"$ {e.get('command', '')[:100]}")
-                    if lines:
-                        console.print(Panel(
-                            "\n".join(lines),
-                            title="Change log",
-                            border_style="blue",
-                            box=box.ROUNDED,
-                        ))
+                            lines.append(f"  [dim]$[/] {e.get('command', '')[:80]}")
+                    console.print(Panel(
+                        "\n".join(lines),
+                        title="Changes",
+                        border_style="blue",
+                        box=box.ROUNDED,
+                        padding=(0, 1),
+                    ))
 
+        # Fallback
         if final_text and not self.session.last_assistant():
             cleaned = clean_llm_text(final_text)
-            if cleaned:
+            if cleaned.strip():
+                console.print()
                 console.print(Panel(
                     Markdown(cleaned),
-                    title="AI",
                     border_style="green",
                     box=box.ROUNDED,
+                    padding=(0, 2),
                 ))
 
     async def _handle_command(self, raw: str) -> bool:
@@ -204,7 +239,7 @@ class AgentShell:
                 for e in self.tools.change_log:
                     console.print(f"  {e}")
         elif cmd == "/help":
-            console.print(Markdown("""
+            console.print(Markdown("""\
 **Commands:**
 - `/help` — Show this help
 - `/clear` — Clear session and screen

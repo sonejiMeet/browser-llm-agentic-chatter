@@ -29,6 +29,24 @@ def _truncate(text: str, limit: int = 6000) -> str:
     )
 
 
+def _normalize_indent(content: str, marker: str = "→", spaces: int = 4) -> str:
+    """Convert leading indent markers to spaces. '→' = 4 spaces, '→→' = 8."""
+    lines = content.split("\n")
+    out = []
+    for line in lines:
+        if line and line[0] == marker:
+            level = 0
+            for ch in line:
+                if ch == marker:
+                    level += 1
+                else:
+                    break
+            out.append(" " * (level * spaces) + line[level:])
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def _unified_diff(path: str, before: str, after: str, max_lines: int = 80) -> str:
     """Produce a compact unified diff of file changes."""
     before_lines = before.splitlines(keepends=True)
@@ -305,6 +323,8 @@ class ToolExecutor:
             pass
         # Drop trailing [[[END]]] leakage if model botched markers
         content = re.sub(r"\n?\[\[\[END\]{2,}\s*$", "", content)
+        # Convert indent markers (> → 4 spaces, >> → 8 spaces, etc.)
+        content = _normalize_indent(content)
 
         p = Path(path_str).expanduser()
         if not p.is_absolute():

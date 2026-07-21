@@ -1,7 +1,7 @@
 """
 server.py — Minimal OpenAI-compatible API server for the browser LLM agent.
 
-One browser session. One request at a time. No streaming, no polling hacks.
+One browser session. One request at a time. Streaming SSE with live agent events.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import queue
 import sys
 import threading
 import time
@@ -21,7 +22,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 from browser import BrowserBridge
 from tools import ToolExecutor
-from agent_core import AgentLoop, extract_hermes_user_message, build_system_prompt
+from agent_core import AgentLoop, AgentEvent, extract_hermes_user_message, build_system_prompt
 from privacy import redact_text, workspace_label
 
 
@@ -31,6 +32,8 @@ _loop: asyncio.AbstractEventLoop | None = None
 _bridge: BrowserBridge | None = None
 _agent: AgentLoop | None = None
 _busy = threading.Lock()
+_last_user_msg: str | None = None
+_last_response: str | None = None
 
 
 def _run(coro, timeout=300):
@@ -58,6 +61,12 @@ async def _init(config: dict):
     prompt = build_system_prompt(config)
     prompt = redact_text(prompt)
     await _bridge.send_message(prompt)
+    # Discard the LLM's initial acknowledgement so it doesn't
+    # leak into the first user turn.
+    try:
+        await _bridge.wait_for_response()
+    except Exception:
+        pass
     print("[server] Agent ready.")
 
 
@@ -74,10 +83,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw = self.rfile.read(int(self.headers["Content-Length"]))
             body = json.loads(raw)
-            # Log what Hermes actually sends (model name, stream flag)
             stream = body.get("stream", False)
             model_req = body.get("model", "?")
-            # Only print this once per session to avoid spam
             if not hasattr(Handler, "_logged_request"):
                 print(f"[debug] Hermes requests: model={model_req} stream={stream}")
                 Handler._logged_request = True
@@ -92,21 +99,36 @@ class Handler(BaseHTTPRequestHandler):
 
         print(f"\n[request] {user_msg[:100].replace(chr(10), ' ')}...")
 
+        global _last_user_msg, _last_response
+        if user_msg == _last_user_msg and _last_response is not None:
+            print(f"  [cached] duplicate user message — returning last response")
+            if stream:
+                self._stream_response(model_req, _last_response)
+            else:
+                self._json_response(model_req, _last_response)
+            return
+
         if not _busy.acquire(blocking=False):
             self._json(503, {"error": {"message": "Server busy"}})
             return
 
         try:
-            response = _run(_run_turn(user_msg), timeout=600)
+            if stream:
+                self._stream_agent_loop(model_req, user_msg)
+            else:
+                response = _run(_run_turn(user_msg), timeout=600)
+                print(f"[response] {response[:120].replace(chr(10), ' ')}...")
+                _last_user_msg = user_msg
+                _last_response = response
+                self._json_response(model_req, response)
         except Exception as e:
             print(f"[error] {e}")
-            self._json(500, {"error": {"message": str(e)}})
+            try:
+                self._json(500, {"error": {"message": str(e)}})
+            except Exception:
+                pass
+        finally:
             _busy.release()
-            return
-
-        print(f"[response] {response[:120].replace(chr(10), ' ')}...")
-        self._json_response(model_req, response)
-        _busy.release()
 
     def do_GET(self):
         if self.path in ("/v1/models", "/v1/models/"):
@@ -115,6 +137,70 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok" if _bridge else "starting"})
         else:
             self._json(404, {"error": {"message": "Not found"}})
+
+    # ── streaming agent loop ────────────────────────────────────
+
+    def _stream_agent_loop(self, model_req: str, user_msg: str):
+        """Run the agent turn, pushing live events as SSE deltas to Hermes."""
+        q: queue.Queue = queue.Queue()
+
+        # Schedule the agent on the asyncio event loop
+        asyncio.run_coroutine_threadsafe(_run_turn(user_msg, q), _loop)
+
+        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        full_text = ""
+        first = True
+        try:
+            while True:
+                try:
+                    chunk = q.get(timeout=600)
+                except queue.Empty:
+                    break
+                if chunk is None:       # sentinel — turn complete
+                    break
+                full_text += chunk
+                delta = {"content": chunk}
+                if first:
+                    delta["role"] = "assistant"
+                    first = False
+                sse = {
+                    "id": cid, "object": "chat.completion.chunk",
+                    "created": created, "model": model_req,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                }
+                self.wfile.write(f"data: {json.dumps(sse, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Hermes disconnected
+
+        # Cache for dedup
+        global _last_user_msg, _last_response
+        _last_user_msg = user_msg
+        _last_response = full_text.strip()
+
+        # Final chunk
+        final = {
+            "id": cid, "object": "chat.completion.chunk",
+            "created": created, "model": model_req,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        try:
+            self.wfile.write(f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+
+    # ── response helpers ────────────────────────────────────────
 
     def _json(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -134,6 +220,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _stream_response(self, model_name, text):
+        """One-shot SSE (for cached responses — still fast)."""
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
         self.send_response(200)
@@ -156,11 +243,61 @@ class Handler(BaseHTTPRequestHandler):
 
 # ── agent turn ──────────────────────────────────────────────────────
 
-async def _run_turn(user_msg: str) -> str:
-    """Run the agent loop and return the final report text."""
+def _fmt_event(ev: AgentEvent) -> str:
+    """Format an agent event for Hermes display.
+    Uses plain ASCII — no markdown syntax that shows as garbage if Hermes
+    renders streaming deltas raw. Indentation and [OK]/[ERR] tags give
+    visual hierarchy without needing markdown rendering."""
+    kind = ev.kind
+
+    if kind == "status":
+        return f"  ... {ev.text}\n"
+
+    if kind == "tool_start":
+        # ev.text already has prefix ($ cmd, write path, read path)
+        return f"\n{ev.text}\n"
+
+    if kind == "tool_result":
+        ok = ev.data.get("ok", True)
+        text = ev.text.strip()
+        if ok:
+            if "\n" in text:
+                # Multi-line: indent each line, show [OK] header
+                lines = text.split("\n")[:60]
+                body = "\n".join(f"    {l}" for l in lines)
+                return f"  [OK]\n{body}\n"
+            return f"  [OK] {text[:250]}\n"
+        else:
+            return f"  [ERR] {text[:400]}\n"
+
+    if kind == "response":
+        text = ev.text.strip()
+        if not text:
+            return ""
+        return f"\n{text}\n"
+
+    if kind == "report":
+        if ev.data.get("results"):
+            return f"\n{ev.text}\n"
+        return ""
+
+    if kind == "done":
+        return ""
+
+    if kind == "error":
+        return f"\n[ERROR] {ev.text}\n"
+
+    return ""
+
+
+async def _run_turn(user_msg: str, q: queue.Queue | None = None) -> str:
+    """Run the agent loop. If *q* is given, push formatted string chunks
+    for live SSE streaming. Always returns the final text for non-streaming
+    callers (and for the server console log)."""
     parts: list[str] = []
     last_text = ""
     async for ev in _agent.run_turn(user_msg):
+        # Server console log
         if ev.kind == "status":
             print(f"  [{ev.kind}] {ev.text}")
         elif ev.kind == "tool_start":
@@ -175,6 +312,16 @@ async def _run_turn(user_msg: str) -> str:
                 parts.append(ev.text)
         elif ev.kind in ("done", "report", "error"):
             last_text = ev.text
+
+        # Push to streaming queue
+        if q is not None:
+            chunk = _fmt_event(ev)
+            if chunk:
+                q.put(chunk)
+
+    if q is not None:
+        q.put(None)  # sentinel
+
     return last_text or "\n".join(parts)
 
 

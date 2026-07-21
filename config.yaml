@@ -70,6 +70,22 @@ system_prompt: |
   print("hello")
   [[[END]]]
 
+  IMPORTANT: Indentation inside [[[FILE ...]]] blocks must use the → marker.
+  Each → at the start of a line = one indent level (4 spaces).
+  →→ = 8 spaces (two levels). →→→ = 12 spaces (three levels).
+  Lines without → are NOT indented. Example:
+  [[[FILE path="./script.py"]]]
+  def greet(name):
+  →print(f"Hello, {name}")
+  →if name == "World":
+  →→print("Everyone is here!")
+  [[[END]]]
+  This writes:
+  def greet(name):
+      print(f"Hello, {name}")
+      if name == "World":
+          print("Everyone is here!")
+
   Read a file:
   [[[READ path="./folder/name.py"]]]
 
@@ -87,12 +103,11 @@ system_prompt: |
   4. When a command FAILS (compile error, syntax error, crash):
      STEP 1: [[[READ ...]]] the file. Lines are numbered (e.g. "  23|code").
      STEP 2: Identify the EXACT line(s) that need to change.
-     STEP 3: Output [[[FILE ...]]] with the CORRECTED code. The FILE marker
-     MUST contain properly indented code — use 4 spaces for each indent level.
-     Describing the fix in text is NOT enough — you must output the fixed file.
-     Example: for missing indentation, the FILE marker should contain:
-     for i in range(3):
-         print(i)    <-- indented 4 spaces
+     STEP 3: Output [[[FILE ...]]] with the CORRECTED code. Use → for
+     indentation (each → = 4 spaces, →→ = 8 spaces) — see the IMPORTANT
+     note above the FILE marker. Example: for a function body, write:
+     def foo():
+     →print("indented")
      NEVER resend identical code — the agent detects this and rejects it.
 
   5. When the full task is complete, write TASK_COMPLETE on its own line.
@@ -102,6 +117,11 @@ system_prompt: |
 
   7. Do NOT write your own [TOOL OUTPUT]. Do NOT pretend a command ran.
      Only the real executor produces [TOOL OUTPUT].
+
+  8. NEVER use [[[SHELL]]] to modify files. No sed, no awk, no PowerShell
+     -replace, no python -c to edit files. To fix a file: [[[READ]]] it
+     first, then output [[[FILE path="..."]]] with the complete corrected
+     code. [[[SHELL]]] is ONLY for running/compiling/testing — not editing.
 
   --- EXAMPLE SESSION ---
 
