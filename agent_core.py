@@ -107,6 +107,59 @@ def _extract_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _build_turn_summary(results: list[dict], complete: bool) -> str:
+    """Build a concise summary of what was done and how to run things."""
+    if not results:
+        return ""
+    files_created: list[str] = []
+    files_modified: list[str] = []
+    binaries: list[str] = []
+    scripts: list[str] = []
+
+    for r in results:
+        if r.get("type") == "file_write" and not r.get("error"):
+            path = r.get("path", "")
+            if r.get("mode") == "create":
+                files_created.append(path)
+            else:
+                files_modified.append(path)
+            # Detect runnable artifacts
+            if path.endswith((".exe", ".bin", ".out", ".app")):
+                binaries.append(f"./{path}")
+            elif path.endswith((".py", ".sh", ".bash", ".ps1")):
+                scripts.append(f"python ./{path}" if path.endswith(".py") else f"./{path}")
+        elif r.get("type") == "shell" and not r.get("error"):
+            cmd = r.get("command", "")
+            # Detect compilation commands that produce executables
+            m = re.search(r'(?:gcc|g\+\+|clang|rustc|go build|javac)\s+.+?\s+-o\s+(\S+)', cmd)
+            if m:
+                binaries.append(m.group(1))
+            # pip install, npm install, etc.
+            m = re.search(r'(?:pip|npm|cargo)\s+install\s+(\S+)', cmd)
+            if m:
+                pass  # installed packages, not runnable
+
+    parts: list[str] = []
+    if complete:
+        parts.append("Task completed.")
+    else:
+        parts.append("Task stopped.")
+
+    if files_created:
+        parts.append(f"Created: {', '.join(files_created[:10])}")
+    if files_modified:
+        parts.append(f"Modified: {', '.join(files_modified[:10])}")
+
+    # Deduplicate binaries and scripts
+    binaries = list(dict.fromkeys(binaries))
+    scripts = list(dict.fromkeys(scripts))
+    if binaries:
+        parts.append("Run: " + "  |  ".join(binaries))
+    if scripts:
+        parts.append("Run: " + "  |  ".join(scripts))
+    return "\n".join(parts)
+
+
 class AgentLoop:
     """Run the browser-LLM <-> local-tools loop, yielding AgentEvents."""
 
@@ -290,6 +343,8 @@ class AgentLoop:
 
             if not results:
                 final_clean = cleaned or last_raw.strip()
+                complete = "TASK_COMPLETE" in last_raw
+                summary = _build_turn_summary(all_results, complete)
                 report = self.tools.format_agent_report(all_results, final_clean)
                 yield AgentEvent(
                     "report",
@@ -298,7 +353,8 @@ class AgentLoop:
                         "results": all_results,
                         "cleaned": final_clean,
                         "raw": last_raw,
-                        "complete": "TASK_COMPLETE" in last_raw,
+                        "complete": complete,
+                        "summary": summary,
                     },
                 )
                 yield AgentEvent(
@@ -307,7 +363,8 @@ class AgentLoop:
                     {
                         "results": all_results,
                         "cleaned": final_clean,
-                        "complete": "TASK_COMPLETE" in last_raw,
+                        "complete": complete,
+                        "summary": summary,
                     },
                 )
                 return
@@ -372,8 +429,10 @@ class AgentLoop:
                 return
 
         report = self.tools.format_agent_report(all_results, clean_llm_text(last_raw))
+        summary = _build_turn_summary(all_results, False)
         yield AgentEvent(
             "done",
             report + "\n\n[Agent stopped: max tool rounds reached]",
-            {"results": all_results, "cleaned": clean_llm_text(last_raw), "complete": False},
+            {"results": all_results, "cleaned": clean_llm_text(last_raw),
+             "complete": False, "summary": summary},
         )

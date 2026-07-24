@@ -188,6 +188,19 @@ class AgentShell:
                 console.print(f"\n[bold red]✗ ERROR:[/] {event.text}")
 
             elif event.kind == "done":
+                # Summary (TASK_COMPLETE or end-of-turn)
+                summary = event.data.get("summary", "")
+                complete = event.data.get("complete", False)
+                if summary:
+                    style = "green" if complete else "yellow"
+                    console.print(Panel(
+                        summary,
+                        title="Summary",
+                        border_style=style,
+                        box=box.ROUNDED,
+                        padding=(0, 1),
+                    ))
+                # Change log
                 if self.tools.change_log:
                     lines: list[str] = []
                     for e in self.tools.change_log:
