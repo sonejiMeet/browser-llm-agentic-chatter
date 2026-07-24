@@ -176,7 +176,8 @@ class AgentLoop:
         self.max_tool_rounds = max_tool_rounds
         self._primed = False
         self._state: Optional[TurnState] = None
-        self._asked_for_path: bool = False  # prevent ask-loop
+        self._summary_pending: bool = False  # set True after asking for summary
+        self._path_requested: bool = False   # prevent path-ask loop
 
     async def prime(self) -> str:
         """Send system prompt and WAIT for the LLM to finish processing it.
@@ -221,7 +222,8 @@ class AgentLoop:
         doesn't waste turns on discovery.
         """
         self.tools.reset_change_log()
-        self._asked_for_path = False
+        self._summary_pending = False
+        self._path_requested = False
         all_results: list[dict] = []
 
         # Initialize turn state for progress tracking
@@ -318,8 +320,8 @@ class AgentLoop:
                     wrapped = f'[[[FILE path="{path}"]]]\n{code}\n[[[END]]]'
                     yield AgentEvent("status", f"Extracted path from response -> {path}")
                     results = self.tools.execute_tool_calls(wrapped)
-                elif not self._asked_for_path and round_i < self.max_tool_rounds - 1:
-                    self._asked_for_path = True
+                elif not self._path_requested and round_i < self.max_tool_rounds - 1:
+                    self._path_requested = True
                     ask = (
                         "I found code in your response but no [[[FILE path=\"...\"]]] "
                         "marker. Where should I save this?\n\n"
@@ -343,9 +345,11 @@ class AgentLoop:
 
             if not results:
                 if "TASK_COMPLETE" in last_raw:
-                    # Ask LLM for a final summary before ending
-                    if not self._asked_for_path and round_i < self.max_tool_rounds - 1:
-                        self._asked_for_path = True  # reuse flag to prevent looping
+                    # Ask LLM for a final summary before ending.
+                    # After asking, set _summary_pending so the NEXT response
+                    # (the summary) is displayed and the loop ends immediately.
+                    if not self._summary_pending and round_i < self.max_tool_rounds - 1:
+                        self._summary_pending = True
                         yield AgentEvent("status", "TASK_COMPLETE received — asking for summary...")
                         try:
                             await self.bridge.send_message(
@@ -354,7 +358,9 @@ class AgentLoop:
                             )
                             continue
                         except Exception:
-                            pass  # fall through to done if send fails
+                            pass
+                    # _summary_pending was True: this IS the summary response.
+                    # Display it and end the loop.
                     complete = True
                     summary = _build_turn_summary(all_results, complete)
                     report = self.tools.format_agent_report(all_results, cleaned or last_raw.strip())
