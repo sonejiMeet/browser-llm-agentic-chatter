@@ -6,6 +6,7 @@ model selection for multi-model providers like Perplexity.
 
 import asyncio
 import platform
+import re
 import time
 from pathlib import Path
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
@@ -545,7 +546,7 @@ class BrowserBridge:
                 if text and text.strip():
                     # Verify [[[ markers survived the copy — ChatGPT may strip them
                     if "[[[" in text:
-                        return text.strip()
+                        return self._strip_thinking(text.strip())
                     # Markers lost — fall through to innerText
             except Exception:
                 pass
@@ -553,17 +554,34 @@ class BrowserBridge:
         # Method 2: innerText (preserves [[[ brackets ChatGPT copy drops)
         text = await _read_innertext()
         if text:
-            return text
+            return self._strip_thinking(text)
 
         # Method 3: textContent (absolute fallback)
         try:
             messages = await self._page.query_selector_all(resp_sel)
             if messages:
                 t = await messages[-1].evaluate("el => el.textContent")
-                return (t or "").strip()
+                return self._strip_thinking((t or "").strip())
         except Exception as e:
             return f"[ERROR reading response: {e}]"
         return "[No response found]"
+
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Remove DeepSeek R1 thinking blocks from copied response text.
+        The Copy button grabs the 'thinking' section before the actual answer.
+        Strips everything before a --- separator line."""
+        if not text:
+            return text
+        # Pattern: "---" on its own line separates thinking from answer
+        parts = re.split(r'\n---+\n', text, maxsplit=1)
+        if len(parts) == 2 and len(parts[1].strip()) > 20:
+            return parts[1].strip()
+        # Triple-newline with substantial text before it
+        idx = text.find("\n\n\n")
+        if idx > 200:
+            return text[idx:].strip()
+        return text
 
     async def get_full_conversation(self) -> str:
         try:
