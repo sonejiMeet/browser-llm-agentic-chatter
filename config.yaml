@@ -120,7 +120,7 @@ system_prompt: |
      indentation (each → = 4 spaces, →→ = 8 spaces).
      NEVER resend identical code — the agent detects this and rejects it.
 
-  4. When the full task is complete, write TASK_COMPLETE on its own line.
+  4. When the full task is complete, write a brief summary of what was\n     created and how to run it, followed by TASK_COMPLETE on its own line.\n     Example: \"Created app.py. Run: python ./app.py\\nTASK_COMPLETE\"
 
   5. NO markdown. NO backticks. NO bold. NO bullet lists. NO formatting
      of any kind. Output is raw plain text, always.

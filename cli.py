@@ -188,7 +188,11 @@ class AgentShell:
                 console.print(f"\n[bold red]✗ ERROR:[/] {event.text}")
 
             elif event.kind == "done":
-                # Summary (TASK_COMPLETE or end-of-turn)
+                # LLM's final message (TASK_COMPLETE stripped)
+                final_msg = event.data.get("cleaned", "")
+                if final_msg and final_msg.strip():
+                    console.print(f"[bold]Agent:[/] {final_msg.strip()}")
+                # Machine summary (files, run commands)
                 summary = event.data.get("summary", "")
                 complete = event.data.get("complete", False)
                 if summary:
