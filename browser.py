@@ -38,15 +38,15 @@ SELECTORS = {
         "copy_btn": 'button[aria-label="Copy"], button[data-action="copy"]',
     },
     "perplexity": {
-        "input": 'textarea[placeholder*="Ask"], textarea[placeholder*="ask"], div[contenteditable="true"]',
-        "submit": 'button[aria-label="Submit"], button[type="submit"]',
+        "input": '#ask-input',
+        "submit": 'button[aria-label="Use voice mode"]',
         "response": "div.prose, div[data-testid='answer'], div.answer-content",
         "stop_button": 'button[aria-label="Stop generating"]',
-        "new_chat": 'button:has-text("New Thread"), a:has-text("Home")',
-        "model_btn": 'button:has-text("Sonar"), button:has-text("GPT"), button:has-text("Claude"), [data-testid="model-selector"]',
-        "model_option": 'div[role="option"], div[role="menuitem"], button',
-        "model_dropdown": 'div[role="listbox"], div[role="menu"]',
+        "new_chat": 'a[aria-label="New"]',
         "copy_btn": 'button[aria-label="Copy"]',
+        "model_btn": 'div[data-ask-input-container="true"] button[aria-haspopup="menu"]',
+        "model_dropdown": 'div[role="menu"]',
+        "model_option": 'div[role="menu"] div[role="menuitemradio"]',
     },
     "deepseek": {
         "input": 'textarea[placeholder="Message DeepSeek"]',
@@ -142,51 +142,47 @@ class BrowserBridge:
         return False
 
     async def _select_model_perplexity(self, model_name: str) -> bool:
-        model_btn_sel = self.selectors.get("model_btn")
-        if not model_btn_sel:
-            return False
-
+        """Select a model from Perplexity's dropdown."""
         try:
-            btn = await self._page.query_selector(model_btn_sel)
+            btn_sel = self.selectors.get("model_btn")
+            btn = await self._page.query_selector(btn_sel)
             if not btn:
                 return False
-
-            current = await btn.inner_text()
-            if model_name.lower() in current.lower():
+            # Check if already selected
+            current_label = await btn.get_attribute("aria-label")
+            if model_name.lower() in (current_label or "").lower():
                 return True
-
             await btn.click()
-            await asyncio.sleep(0.5)
-
-            dropdown = await self._page.query_selector(
-                self.selectors.get("model_dropdown", 'div[role="listbox"]')
-            )
+            await asyncio.sleep(0.3)
+            # Find the dropdown menu
+            dropdown_sel = self.selectors.get("model_dropdown")
+            dropdown = await self._page.query_selector(dropdown_sel)
             if not dropdown:
-                option = await self._page.query_selector(
-                    f'div[role="option"]:has-text("{model_name}"), '
-                    f'div[role="menuitem"]:has-text("{model_name}"), '
-                    f'button:has-text("{model_name}")'
-                )
-                if option:
-                    await option.click()
-                    await asyncio.sleep(0.3)
-                    print(f"  [model] Selected: {model_name}")
+                dropdown = await self._page.query_selector('div[role="menu"]:not([hidden])')
+            if not dropdown:
+                return False
+            # Find matching option
+            option_sel = self.selectors.get("model_option")
+            options = await dropdown.query_selector_all(option_sel)
+            for opt in options:
+                text = await opt.inner_text()
+                if model_name.lower() in text.lower():
+                    await opt.click()
+                    await asyncio.sleep(0.2)
+                    print(f"  [model] Perplexity: {model_name}")
                     return True
-            else:
-                options = await dropdown.query_selector_all(
-                    'div[role="option"], div[role="menuitem"]'
-                )
-                for opt in options:
-                    text = await opt.inner_text()
-                    if model_name.lower() in text.lower():
-                        await opt.click()
-                        await asyncio.sleep(0.3)
-                        print(f"  [model] Selected: {model_name}")
-                        return True
-
+            # Broad fallback
+            all_opts = await self._page.query_selector_all(
+                f'div[role="menuitemradio"]:has-text("{model_name}")'
+            )
+            if all_opts:
+                await all_opts[0].click()
+                await asyncio.sleep(0.2)
+                print(f"  [model] Perplexity: {model_name}")
+                return True
             return False
         except Exception as e:
-            print(f"  [model] Selection failed: {e}")
+            print(f"  [model] Perplexity selection failed: {e}")
             return False
 
     async def _select_model_deepseek(self, model_name: str) -> bool:
