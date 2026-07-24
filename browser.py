@@ -493,7 +493,7 @@ class BrowserBridge:
         """Read the last assistant response via the Copy button.
         Gets the raw markdown/text exactly as the LLM output it —
         preserves indentation, code blocks, and formatting.
-        Falls back to textContent if copy fails."""
+        Falls back to innerText then textContent if copy fails."""
         copy_sel = self.selectors.get("copy_btn")
 
         # Method 1: click copy button → read clipboard
@@ -505,12 +505,19 @@ class BrowserBridge:
                         if (!btns.length) return null;
                         // Click the last copy button (belongs to last message)
                         btns[btns.length - 1].click();
-                        await new Promise(r => setTimeout(r, 300));
+                        // Wait for clipboard to populate (large responses need more time)
+                        await new Promise(r => setTimeout(r, 800));
                         try {
-                            return await navigator.clipboard.readText();
+                            let t = await navigator.clipboard.readText();
+                            if (t && t.trim()) return t;
+                            // Retry after another delay
+                            await new Promise(r => setTimeout(r, 600));
+                            t = await navigator.clipboard.readText();
+                            if (t && t.trim()) return t;
                         } catch (e) {
                             return null;
                         }
+                        return null;
                     }
                 """, copy_sel)
                 if text and text.strip():
@@ -518,13 +525,25 @@ class BrowserBridge:
             except Exception:
                 pass
 
-        # Method 2: fallback — textContent from last response element
+        # Method 2: innerText from last response element
+        # (preserves visible text better than textContent, handles [[[ brackets])
+        try:
+            messages = await self._page.query_selector_all(self.selectors["response"])
+            if messages:
+                last = messages[-1]
+                text = await last.evaluate("el => el.innerText || el.textContent")
+                if text and text.strip():
+                    return text.strip()
+        except Exception:
+            pass
+
+        # Method 3: textContent (absolute fallback)
         try:
             messages = await self._page.query_selector_all(self.selectors["response"])
             if messages:
                 last = messages[-1]
                 text = await last.evaluate("el => el.textContent")
-                return text.strip()
+                return text.strip() if text else ""
         except Exception as e:
             return f"[ERROR reading response: {e}]"
         return "[No response found]"
