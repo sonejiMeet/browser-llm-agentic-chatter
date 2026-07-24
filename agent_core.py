@@ -342,32 +342,39 @@ class AgentLoop:
                 yield AgentEvent("response", cleaned, {"round": round_i + 1})
 
             if not results:
-                final_clean = cleaned or last_raw.strip()
-                complete = "TASK_COMPLETE" in last_raw
-                summary = _build_turn_summary(all_results, complete)
-                report = self.tools.format_agent_report(all_results, final_clean)
-                yield AgentEvent(
-                    "report",
-                    report,
-                    {
-                        "results": all_results,
-                        "cleaned": final_clean,
-                        "raw": last_raw,
-                        "complete": complete,
-                        "summary": summary,
-                    },
-                )
-                yield AgentEvent(
-                    "done",
-                    report if report else final_clean,
-                    {
-                        "results": all_results,
-                        "cleaned": final_clean,
-                        "complete": complete,
-                        "summary": summary,
-                    },
-                )
-                return
+                # Only stop the loop on explicit TASK_COMPLETE.
+                # LLM prose without markers is just conversation —
+                # feed it back and continue, don't stop.
+                if "TASK_COMPLETE" in last_raw:
+                    complete = True
+                    summary = _build_turn_summary(all_results, complete)
+                    report = self.tools.format_agent_report(all_results, cleaned or last_raw.strip())
+                    yield AgentEvent("report", report, {
+                        "results": all_results, "cleaned": cleaned or last_raw.strip(),
+                        "raw": last_raw, "complete": complete, "summary": summary,
+                    })
+                    yield AgentEvent("done", report, {
+                        "results": all_results, "cleaned": cleaned or last_raw.strip(),
+                        "complete": complete, "summary": summary,
+                    })
+                    return
+                # LLM wrote text but no tool calls and no TASK_COMPLETE —
+                # feed its message back as context so it can continue.
+                if cleaned:
+                    yield AgentEvent("status", "No tool calls in response — feeding back to LLM...")
+                    try:
+                        await self.bridge.send_message(
+                            f"[No tool calls detected in your response. "
+                            f"Continue with [[[FILE ...]]], [[[SHELL]]], or [[[READ ...]]] "
+                            f"if you need to take action.]\n\n"
+                            f"Your message:\n{cleaned[:1000]}"
+                        )
+                        continue
+                    except Exception as e:
+                        yield AgentEvent("error", f"Failed to send prose feedback: {e}")
+                        return
+                # Empty response? Just continue
+                continue
 
             for r in results:
                 all_results.append(r)
