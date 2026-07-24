@@ -68,68 +68,43 @@ def clean_llm_text(text: str) -> str:
 
 
 def _looks_like_code(text: str) -> bool:
-    """Heuristic: does this text look like source code rather than prose?
-    Used to detect when the LLM outputs raw code without markers."""
-    if not text or len(text) < 20:
+    """Heuristic: does text look like source code?"""
+    if not text or len(text) < 20 or text.count("\n") < 1:
         return False
-    lines = text.split("\n")
-    if len(lines) < 2:
-        return False
-    # Strong code signals
-    code_signals = [
-        r"#include\s*[<\"]",    # C/C++ include
-        r"\bint\s+main\s*\(",   # C main
-        r"\bdef\s+\w+\s*\(",    # Python/Ruby function
-        r"\bfn\s+\w+\s*\(",     # Rust function
-        r"\bfunc\s+\w+\s*\(",   # Go function
-        r"\bfunction\s+\w+\s*\(", # JS function
-        r"\bclass\s+\w+",       # class definition
-        r"\bimport\s+",         # import statement
-        r"\bfrom\s+\w+\s+import", # Python from-import
-        r"\bconst\s+\w+\s*=",   # JS/TS const
-        r"\blet\s+\w+\s*=",     # JS let
-        r"\bvar\s+\w+\s*=",     # JS var
-        r"^\s*\}?\s*$",         # closing braces are common in code
+    signals = [
+        r"#include\s*[<\"]", r"\bint\s+main\s*\(", r"\bdef\s+\w+\s*\(",
+        r"\bfn\s+\w+\s*\(", r"\bfunc\s+\w+\s*\(", r"\bfunction\s+\w+\s*\(",
+        r"\bclass\s+\w+", r"\bimport\s+", r"\bfrom\s+\w+\s+import",
+        r"\bconst\s+\w+\s*=", r"\blet\s+\w+\s*=", r"\bvar\s+\w+\s*=",
     ]
-    for signal in code_signals:
-        if re.search(signal, text, re.MULTILINE):
-            return True
-    # Heuristic: high ratio of punctuation/symbols to words
-    alpha_chars = sum(1 for c in text if c.isalpha())
-    punct_chars = sum(1 for c in text if c in "{}()[];=+-*/<>!&|^~")
-    if alpha_chars > 0 and punct_chars / max(alpha_chars, 1) > 0.05:
-        # Also check for natural language signals
-        common_words = ["the", "and", "that", "have", "for", "you", "with", "this"]
-        word_count = sum(1 for w in common_words if re.search(rf"\b{w}\b", text, re.IGNORECASE))
-        if word_count < 3:  # few common English words → probably code
+    if any(re.search(s, text, re.MULTILINE) for s in signals):
+        return True
+    a = sum(1 for c in text if c.isalpha())
+    p = sum(1 for c in text if c in "{}()[];=+-*/<>!&|^~")
+    if a > 0 and p / a > 0.05:
+        common = ["the", "and", "that", "have", "for", "you", "with", "this"]
+        if sum(1 for w in common if re.search(rf"\b{w}\b", text, re.IGNORECASE)) < 3:
             return True
     return False
 
 
-def _guess_code_filename(text: str) -> str:
-    """Guess a reasonable filename from code content.
-    Used when auto-wrapping raw code that the LLM refused to mark up."""
-    # Check for language-specific signals
-    if re.search(r"#include\s*[<\"]", text) or re.search(r"\bint\s+main\s*\(", text):
-        return "agent_output.c"
-    # C-like fragments: for-loops with type declarations, printf, type casts
-    if re.search(r"\bfor\s*\(\s*(int|char|float|double|size_t)\s", text):
-        return "agent_output.c"
-    if re.search(r"\bprintf\s*\(", text) or re.search(r"\bscanf\s*\(", text):
-        return "agent_output.c"
-    if re.search(r"\bdef\s+\w+\s*\(", text) or re.search(r"\bimport\s+\w", text):
-        return "agent_output.py"
-    if re.search(r"\bfn\s+\w+\s*\(", text) or re.search(r"\buse\s+\w+::", text):
-        return "agent_output.rs"
-    if re.search(r"\bfunc\s+\w+\s*\(", text) and re.search(r"\bpackage\s+\w", text):
-        return "agent_output.go"
-    if re.search(r"\bfunction\s+\w+\s*\(", text) or re.search(r"\bconst\s+\w+\s*=", text):
-        return "agent_output.js"
-    if re.search(r"<\w+>", text) or re.search(r"</\w+>", text):
-        return "agent_output.html"
-    if re.search(r"^[.#]\w+\s*\{", text, re.MULTILINE):
-        return "agent_output.css"
-    return "agent_output.txt"
+def _extract_path_from_text(text: str) -> Optional[str]:
+    """Find a file path mentioned in the LLM's response.
+    Matches: ./path/file.ext, path/file.ext, game_of_life/game.c
+    Also catches paths without extension if they look like file paths."""
+    # Try with extension first
+    m = re.search(r'(?:\.?/)?[\w-]+(?:/[\w-]+)*\.[a-zA-Z]{1,6}', text)
+    if m:
+        return m.group(0)
+    # Try paths in quotes: "game_of_life/game_of_life" or './path/file'
+    m = re.search(r'["\']((?:\.?/)?[\w-]+(?:/[\w-]+){1,})["\']', text)
+    if m:
+        return m.group(1)
+    # Try bare paths with slashes that look file-like (no extension)
+    m = re.search(r'(?:\.?/)?[\w-]+(?:/[\w-]+){1,}', text)
+    if m:
+        return m.group(0)
+    return None
 
 
 class AgentLoop:
@@ -148,6 +123,7 @@ class AgentLoop:
         self.max_tool_rounds = max_tool_rounds
         self._primed = False
         self._state: Optional[TurnState] = None
+        self._asked_for_path: bool = False  # prevent ask-loop
 
     async def prime(self) -> str:
         """Send system prompt and WAIT for the LLM to finish processing it.
@@ -192,6 +168,7 @@ class AgentLoop:
         doesn't waste turns on discovery.
         """
         self.tools.reset_change_log()
+        self._asked_for_path = False
         all_results: list[dict] = []
 
         # Initialize turn state for progress tracking
@@ -220,12 +197,6 @@ class AgentLoop:
                 return
 
             last_raw = response or ""
-
-            # ── DIAG: show first 200 chars of raw browser response ──
-            # Remove after confirming [[[ markers arrive intact.
-            if last_raw and ("[[[" not in last_raw[:500] or True):  # always show
-                preview = last_raw[:200].replace("\n", "\\n")
-                yield AgentEvent("status", f"[raw preview] {preview}...")
 
             # ── Parse tool calls on RAW response first ──
             # Backtick/markdown stripping can mangle [[[END]]] markers when
@@ -271,14 +242,6 @@ class AgentLoop:
                         )
 
             # Fallback: strip markdown and retry parsing.
-            # If the LLM output code (in ``` fences or raw), auto-wrap it in
-            # [[[FILE ...]]] markers immediately — no warnings, no delays.
-            # BUT: never auto-wrap text that already contains [[[ markers —
-            # that means the LLM used proper markers and parsing should have
-            # worked. Wrapping marker-bearing text would create nested/mangled
-            # markers and write to the wrong file.
-            code_to_wrap: Optional[str] = None
-
             if not results:
                 parseable = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", last_raw, flags=re.DOTALL)
                 parseable = re.sub(r"`([^`\n]+)`", r"\1", parseable)
@@ -286,23 +249,39 @@ class AgentLoop:
                 parseable = re.sub(r"\*([^*\n]+)\*", r"\1", parseable)
                 if parseable != last_raw:
                     results = self.tools.execute_tool_calls(parseable)
-                    # Still no markers — stripped content is code without markers?
-                    if not results and _looks_like_code(parseable) and "[[[" not in parseable:
-                        code_to_wrap = parseable
 
-            if not results and code_to_wrap is None:
-                # Raw output (no fences) that looks like code — auto-wrap it too.
-                # Guard: don't wrap if markers are present (LLM used them, parser
-                # should have caught it — wrapping would create nested markers).
-                if (_looks_like_code(last_raw) and "[[[" not in last_raw
-                        and round_i < self.max_tool_rounds - 1):
-                    code_to_wrap = last_raw
+            # Code without markers? Try to extract the intended path from the
+            # LLM's response. If found, wrap and execute with THAT path.
+            # If not found, feed the cleaned code back and ask for a path.
+            # Never create default filenames like agent_output.*.
+            if not results and _looks_like_code(last_raw):
+                code = parseable if parseable != last_raw else last_raw
+                path = _extract_path_from_text(last_raw)
+                # Also check task description for path hints
+                if not path and self._state:
+                    path = _extract_path_from_text(self._state.task)
 
-            if code_to_wrap:
-                fname = _guess_code_filename(code_to_wrap)
-                wrapped = f'[[[FILE path="./{fname}"]]]\n{code_to_wrap}\n[[[END]]]'
-                yield AgentEvent("status", f"Auto-wrapped code as ./{fname}")
-                results = self.tools.execute_tool_calls(wrapped)
+                if path:
+                    wrapped = f'[[[FILE path="{path}"]]]\n{code}\n[[[END]]]'
+                    yield AgentEvent("status", f"Extracted path from response -> {path}")
+                    results = self.tools.execute_tool_calls(wrapped)
+                elif not self._asked_for_path and round_i < self.max_tool_rounds - 1:
+                    self._asked_for_path = True
+                    ask = (
+                        "I found code in your response but no [[[FILE path=\"...\"]]] "
+                        "marker. Where should I save this?\n\n"
+                        f"The code I extracted:\n```\n{code[:2000]}\n```\n\n"
+                        "Reply with [[[FILE path=\"./your/path.ext\"]]] ... [[[END]]] "
+                        "to tell me where to save it."
+                    )
+                    yield AgentEvent("status", "Code without path — asking LLM where to save...")
+                    try:
+                        await self.bridge.send_message(ask)
+                        continue
+                    except Exception as e:
+                        yield AgentEvent("error", f"Failed to ask for path: {e}")
+                        return
+                # else: already asked, no path found → fall through to display + end turn
 
             # Display cleaned text (strip markers for user)
             cleaned = clean_llm_text(last_raw)
