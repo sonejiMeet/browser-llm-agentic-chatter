@@ -557,33 +557,38 @@ class BrowserBridge:
         return await self._read_last_response()
 
     async def _wait_for_text_stability(self, deadline: float) -> str:
-        """Fast text-stability polling for providers without reliable
-        stop/copy buttons (DeepSeek). Monitors body text length for quiescence."""
+        """Text-stability polling for providers without reliable stop/copy
+        buttons (DeepSeek). Requires text to have grown beyond the initial
+        snapshot AND remained stable for ~0.5s to avoid capturing mid-stream."""
         try:
             before = await self._page.inner_text("body")
         except Exception:
             before = ""
-        last_len = len(before)
-        stable = 0
-        # Poll more aggressively at first, then back off
+        initial_len = len(before)
+        last_len = initial_len
+        stable_since = 0.0  # timestamp when stability began
         while time.time() < deadline:
             try:
                 current = await self._page.inner_text("body")
             except Exception:
-                await asyncio.sleep(0.04)
+                await asyncio.sleep(0.05)
                 continue
             cur_len = len(current)
+            now = time.time()
             if cur_len > last_len:
                 # Still growing — reset
-                stable = 0
                 last_len = cur_len
+                stable_since = 0.0
                 await asyncio.sleep(0.08)
-            elif cur_len == last_len and cur_len > 0:
-                stable += 1
-                if stable >= 3:  # 3 consecutive stable checks
-                    break
+            elif cur_len == last_len and cur_len > initial_len + 200:
+                # Same length AND has grown meaningfully — track stability
+                if stable_since == 0.0:
+                    stable_since = now
+                elif now - stable_since >= 0.5:
+                    break  # stable for 0.5s
                 await asyncio.sleep(0.06)
             else:
+                # Same length but hasn't grown enough, or shrunk
                 await asyncio.sleep(0.08)
         return await self._read_last_response()
 
