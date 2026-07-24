@@ -62,10 +62,15 @@ async def run_agent(task: str, config: dict):
 
     print("[*] Priming system prompt...")
     await agent.prime()
+
+    # Gather workspace context before the first turn
+    ctx = agent.gather_context()
+    print(f"[*] Workspace: {ctx.root_name} ({ctx.project_type}, {ctx.total_files} files)")
+
     print("[*] Starting agent loop.\n")
 
     turn = 0
-    async for event in agent.run_turn(task):
+    async for event in agent.run_turn(task, workspace_context=ctx):
         if event.kind == "status":
             print(f"  · {event.text}")
         elif event.kind == "response":

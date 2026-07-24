@@ -125,7 +125,13 @@ class AgentShell:
     async def _process_message(self, text: str):
         self.session.add_user(text)
 
-        async for event in self.agent.run_turn(text):
+        # Gather workspace context so the LLM doesn't waste turns on discovery
+        ctx = self.agent.gather_context()
+        console.print(f"  [dim]Workspace: {ctx.root_name} ({ctx.project_type}, {ctx.total_files} files)[/]")
+        if ctx.git_branch:
+            console.print(f"  [dim]Git: {ctx.git_branch}[/]")
+
+        async for event in self.agent.run_turn(text, workspace_context=ctx):
             if event.kind == "status":
                 console.print(f"    [dim italic]{event.text}[/]")
 
