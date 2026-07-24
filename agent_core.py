@@ -342,10 +342,19 @@ class AgentLoop:
                 yield AgentEvent("response", cleaned, {"round": round_i + 1})
 
             if not results:
-                # Only stop the loop on explicit TASK_COMPLETE.
-                # LLM prose without markers is just conversation —
-                # feed it back and continue, don't stop.
                 if "TASK_COMPLETE" in last_raw:
+                    # Ask LLM for a final summary before ending
+                    if not self._asked_for_path and round_i < self.max_tool_rounds - 1:
+                        self._asked_for_path = True  # reuse flag to prevent looping
+                        yield AgentEvent("status", "TASK_COMPLETE received — asking for summary...")
+                        try:
+                            await self.bridge.send_message(
+                                "Task marked complete. Please provide a brief summary: "
+                                "what files were created/modified, and how to run or use them."
+                            )
+                            continue
+                        except Exception:
+                            pass  # fall through to done if send fails
                     complete = True
                     summary = _build_turn_summary(all_results, complete)
                     report = self.tools.format_agent_report(all_results, cleaned or last_raw.strip())
