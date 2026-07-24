@@ -48,7 +48,7 @@ SELECTORS = {
         "copy_btn": 'button[aria-label="Copy"]',
     },
     "deepseek": {
-        "input": 'textarea[placeholder*="message"], textarea[placeholder*="Message"], textarea[placeholder*="Send"], div[contenteditable="true"], #chat-input',
+        "input": 'textarea#chat-input, textarea[placeholder*="Send"], textarea[placeholder*="message"]',
         "submit": 'button[aria-label="Send"], button[type="submit"], div[role="button"]:has(svg)',
         "response": "div.ds-markdown, div[class*='markdown'], div[class*='message'], div[class*='assistant'], div[class*='response']",
         "stop_button": 'button[aria-label="Stop"], button:has(svg), div[role="button"]:has(svg)',
@@ -242,7 +242,10 @@ class BrowserBridge:
     async def _focus_input(self) -> None:
         input_sel = self.selectors["input"]
         await self._page.wait_for_selector(input_sel, timeout=15000)
-        await self._page.click(input_sel, timeout=5000)
+        # Use focus() not click() — clicking can accidentally activate
+        # toggles/search bars if the selector matches a button element.
+        await self._page.focus(input_sel)
+        await asyncio.sleep(0.05)
 
     async def _clear_input(self) -> None:
         await self._page.keyboard.press(f"{self._mod}+a")
