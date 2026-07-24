@@ -56,6 +56,9 @@ SELECTORS = {
         "stop_button": 'button[aria-label="Stop"], div[role="button"] svg[data-icon="stop"]',
         "new_chat": 'div._5a8ac7a:has-text("New chat")',
         "copy_btn": 'button[aria-label="Copy"], div[role="button"]:has-text("Copy")',
+        "model_selector": 'div[role="radiogroup"]',
+        "model_option": 'div[data-model-type="expert"], div[data-model-type="instant"], div[data-model-type="vision"]',
+        "model_selected": 'div[data-model-type][aria-checked="true"]',
     }
 }
 
@@ -124,10 +127,21 @@ class BrowserBridge:
             return True
 
     async def select_model(self, model_name: str) -> bool:
-        """For providers with model selectors (Perplexity)."""
-        if self.provider != "perplexity":
+        """For providers with model selectors (Perplexity dropdown, DeepSeek radio)."""
+        if self.provider not in ("perplexity", "deepseek"):
             return False
 
+        # ── Perplexity: dropdown-based ─────────────────────────────
+        if self.provider == "perplexity":
+            return await self._select_model_perplexity(model_name)
+
+        # ── DeepSeek: radiogroup-based ────────────────────────────
+        if self.provider == "deepseek":
+            return await self._select_model_deepseek(model_name)
+
+        return False
+
+    async def _select_model_perplexity(self, model_name: str) -> bool:
         model_btn_sel = self.selectors.get("model_btn")
         if not model_btn_sel:
             return False
@@ -173,6 +187,39 @@ class BrowserBridge:
             return False
         except Exception as e:
             print(f"  [model] Selection failed: {e}")
+            return False
+
+    async def _select_model_deepseek(self, model_name: str) -> bool:
+        """DeepSeek: radiogroup with data-model-type options."""
+        group_sel = self.selectors.get("model_selector")
+        option_sel = self.selectors.get("model_option")
+        if not group_sel or not option_sel:
+            return False
+        try:
+            group = await self._page.query_selector(group_sel)
+            if not group:
+                return False
+            # Check if already selected
+            selected_sel = self.selectors.get("model_selected")
+            if selected_sel:
+                current = await self._page.query_selector(selected_sel)
+                if current:
+                    cur_type = await current.get_attribute("data-model-type")
+                    if cur_type and model_name.lower() in cur_type.lower():
+                        return True  # already on desired model
+            # Find and click the target option
+            options = await self._page.query_selector_all(option_sel)
+            for opt in options:
+                mtype = await opt.get_attribute("data-model-type") or ""
+                text = await opt.inner_text()
+                if model_name.lower() in mtype.lower() or model_name.lower() in text.lower():
+                    await opt.click()
+                    await asyncio.sleep(0.3)
+                    print(f"  [model] DeepSeek: {model_name}")
+                    return True
+            return False
+        except Exception as e:
+            print(f"  [model] DeepSeek selection failed: {e}")
             return False
 
     async def _response_text_stable(self, timeout: float = 2.0) -> bool:
