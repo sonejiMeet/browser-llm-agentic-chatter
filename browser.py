@@ -449,13 +449,16 @@ class BrowserBridge:
             await self._page.keyboard.press("Enter")
 
     async def wait_for_response(self, timeout_seconds: int = 300) -> str:
-        """Wait for generation to finish. After the stop button disappears,
-        confirms the Copy button is visible — thinking models pause/restart
-        generation (stop button flickers), but Copy only appears when the
-        full response including all thinking blocks is fully rendered."""
+        """Wait for generation to finish. Uses stop/copy button detection
+        for providers with reliable selectors; falls back to text-stability
+        polling for others (DeepSeek, etc.)."""
         stop_sel = self.selectors.get("stop_button")
         copy_sel = self.selectors.get("copy_btn")
         deadline = time.time() + timeout_seconds
+
+        # Providers where button detection is unreliable: use text-stability only
+        if self.provider in ("deepseek",):
+            return await self._wait_for_text_stability(deadline)
 
         if stop_sel and copy_sel:
             # Wait for initial generation to start
@@ -551,6 +554,37 @@ class BrowserBridge:
                 last_len = cur_len
             await asyncio.sleep(0.1)
 
+        return await self._read_last_response()
+
+    async def _wait_for_text_stability(self, deadline: float) -> str:
+        """Fast text-stability polling for providers without reliable
+        stop/copy buttons (DeepSeek). Monitors body text length for quiescence."""
+        try:
+            before = await self._page.inner_text("body")
+        except Exception:
+            before = ""
+        last_len = len(before)
+        stable = 0
+        # Poll more aggressively at first, then back off
+        while time.time() < deadline:
+            try:
+                current = await self._page.inner_text("body")
+            except Exception:
+                await asyncio.sleep(0.04)
+                continue
+            cur_len = len(current)
+            if cur_len > last_len:
+                # Still growing — reset
+                stable = 0
+                last_len = cur_len
+                await asyncio.sleep(0.08)
+            elif cur_len == last_len and cur_len > 0:
+                stable += 1
+                if stable >= 3:  # 3 consecutive stable checks
+                    break
+                await asyncio.sleep(0.06)
+            else:
+                await asyncio.sleep(0.08)
         return await self._read_last_response()
 
     async def _read_last_response(self) -> str:
