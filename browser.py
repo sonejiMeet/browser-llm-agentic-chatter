@@ -48,12 +48,12 @@ SELECTORS = {
         "copy_btn": 'button[aria-label="Copy"]',
     },
     "deepseek": {
-        "input": 'textarea[placeholder*="message"], textarea[placeholder*="Message"], div[contenteditable="true"], #chat-input',
-        "submit": 'button[aria-label="Send"], button[type="submit"], button:has-text("Send")',
-        "response": "div[class*='message'], div[class*='assistant'], div[class*='response'], div.ds-markdown",
-        "stop_button": 'button[aria-label="Stop"], button:has-text("Stop")',
-        "new_chat": 'button:has-text("New Chat"), a:has-text("New Chat"), button:has-text("New chat")',
-        "copy_btn": 'button[aria-label="Copy"], button[class*="copy"]',
+        "input": 'textarea[placeholder*="message"], textarea[placeholder*="Message"], textarea[placeholder*="Send"], div[contenteditable="true"], #chat-input',
+        "submit": 'button[aria-label="Send"], button[type="submit"], div[role="button"]:has(svg)',
+        "response": "div.ds-markdown, div[class*='markdown'], div[class*='message'], div[class*='assistant'], div[class*='response']",
+        "stop_button": 'button[aria-label="Stop"], button:has(svg), div[role="button"]:has(svg)',
+        "new_chat": 'button:has-text("New Chat"), a:has-text("New Chat")',
+        "copy_btn": 'button[aria-label="Copy"], div[role="button"]:has-text("Copy"), button[class*="copy"]',
     },
 }
 
@@ -404,11 +404,12 @@ class BrowserBridge:
         if stop_sel and copy_sel:
             # Wait for initial generation to start
             saw_stop = False
+            gave_up_stop_at = None  # type: float | None
             try:
                 await self._page.wait_for_selector(stop_sel, state="visible", timeout=8000)
                 saw_stop = True
             except Exception:
-                pass
+                gave_up_stop_at = time.time()  # selector didn't match — track when we gave up
 
             # Loop: stop-disappear → check Copy → if stop reappears, loop again
             while time.time() < deadline:
@@ -422,31 +423,30 @@ class BrowserBridge:
                     pass
 
                 # Copy button visible? → full response rendered.
-                # Still need stability: thinking models sometimes show
-                # Copy briefly between blocks, then hide it again.
                 try:
                     btn = await self._page.query_selector(copy_sel)
                     if btn and await btn.is_visible():
                         await asyncio.sleep(0.2)
-                        # Verify text is stable before returning
                         if await self._response_text_stable(timeout=2.0):
                             return await self._read_last_response()
-                        # Not stable — Copy appeared early, keep looping
                 except Exception:
                     pass
 
-                # Not visible yet — brief settle, then check if stop reappeared
+                # Not visible — brief settle, then check if stop reappeared
                 await asyncio.sleep(0.3)
                 try:
                     btn = await self._page.query_selector(stop_sel)
                     if btn and await btn.is_visible():
                         saw_stop = True
-                        continue  # more thinking/response → loop again
+                        continue
                 except Exception:
                     pass
 
                 # Neither stop nor copy visible.
-                # If we never saw generation start, don't assume done — keep waiting.
+                # If we never saw stop AND gave up >15s ago, fall through
+                # to text-stability (selector probably doesn't match this provider).
+                if not saw_stop and gave_up_stop_at and (time.time() - gave_up_stop_at) > 15:
+                    break
                 if not saw_stop:
                     await asyncio.sleep(0.5)
                     continue
