@@ -47,6 +47,14 @@ SELECTORS = {
         "model_dropdown": 'div[role="listbox"], div[role="menu"]',
         "copy_btn": 'button[aria-label="Copy"]',
     },
+    "deepseek": {
+        "input": 'textarea[placeholder*="message"], textarea[placeholder*="Message"], div[contenteditable="true"], #chat-input',
+        "submit": 'button[aria-label="Send"], button[type="submit"], button:has-text("Send")',
+        "response": "div[class*='message'], div[class*='assistant'], div[class*='response'], div.ds-markdown",
+        "stop_button": 'button[aria-label="Stop"], button:has-text("Stop")',
+        "new_chat": 'button:has-text("New Chat"), a:has-text("New Chat"), button:has-text("New chat")',
+        "copy_btn": 'button[aria-label="Copy"], button[class*="copy"]',
+    },
 }
 
 PERPLEXITY_MODELS = [

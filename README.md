@@ -132,6 +132,7 @@ tools:
 | Claude | claude.ai | Sonnet/Opus. |
 | Gemini | gemini.google.com | Google's models. |
 | Perplexity | perplexity.ai | Multi-model. Use `--model`. |
+| DeepSeek | chat.deepseek.com | DeepSeek-V3, R1. |
 
 Login in the browser window on first run. The profile persists in `./browser_profile/`.
 

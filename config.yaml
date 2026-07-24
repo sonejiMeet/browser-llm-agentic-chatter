@@ -1,5 +1,5 @@
 # Target LLM chat provider
-# Options: chatgpt, claude, gemini, perplexity
+# Options: chatgpt, claude, gemini, perplexity, deepseek
 provider: chatgpt
 
 # Model override (for multi-model providers like Perplexity)
@@ -14,6 +14,7 @@ urls:
   claude: "https://claude.ai/"
   gemini: "https://gemini.google.com/"
   perplexity: "https://www.perplexity.ai/?focus=writing"
+  deepseek: "https://chat.deepseek.com/"
 
 # Browser profile directory (stays logged in between runs)
 user_data_dir: "./browser_profile"
