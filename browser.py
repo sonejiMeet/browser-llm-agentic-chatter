@@ -48,13 +48,14 @@ SELECTORS = {
         "copy_btn": 'button[aria-label="Copy"]',
     },
     "deepseek": {
-        "input": 'textarea#chat-input, textarea[placeholder*="Send"], textarea[placeholder*="message"]',
-        "submit": 'button[aria-label="Send"], button[type="submit"], div[role="button"]:has(svg)',
-        "response": "div.ds-markdown, div[class*='markdown'], div[class*='message'], div[class*='assistant'], div[class*='response']",
-        "stop_button": 'button[aria-label="Stop"], button:has(svg), div[role="button"]:has(svg)',
-        "new_chat": 'button:has-text("New Chat"), a:has-text("New Chat")',
-        "copy_btn": 'button[aria-label="Copy"], div[role="button"]:has-text("Copy"), button[class*="copy"]',
-    },
+        "input": 'textarea[placeholder="Message DeepSeek"]',
+        # Use the Enter key method instead of clicking a button
+        "submit": None,  # We'll handle submission via keyboard in code
+        "response": "div.ds-markdown, div[class*='markdown']",
+        "stop_button": 'button[aria-label="Stop"], div[role="button"] svg[data-icon="stop"]',
+        "new_chat": 'div._5a8ac7a:has-text("New chat")',
+        "copy_btn": 'button[aria-label="Copy"], div[role="button"]:has-text("Copy")',
+    }
 }
 
 PERPLEXITY_MODELS = [
@@ -186,7 +187,7 @@ class BrowserBridge:
             try:
                 msgs = await self._page.query_selector_all(resp_sel)
                 if not msgs:
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.1)
                     continue
                 text = await msgs[-1].evaluate("el => el.textContent")
                 if initial_len < 0:
@@ -388,11 +389,15 @@ class BrowserBridge:
         await asyncio.sleep(0.12)
 
         # Submit
-        submit_sel = self.selectors["submit"]
-        try:
-            await self._page.click(submit_sel, timeout=4000)
-        except Exception:
-            # Enter as fallback
+        submit_sel = self.selectors.get("submit")
+        if submit_sel:
+            try:
+                await self._page.click(submit_sel, timeout=3000)
+            except Exception:
+                await self._page.keyboard.press("Enter")
+        else:
+            # Provider uses Enter key (e.g. DeepSeek)
+            await asyncio.sleep(0.05)
             await self._page.keyboard.press("Enter")
 
     async def wait_for_response(self, timeout_seconds: int = 300) -> str:
@@ -409,7 +414,7 @@ class BrowserBridge:
             saw_stop = False
             gave_up_stop_at = None  # type: float | None
             try:
-                await self._page.wait_for_selector(stop_sel, state="visible", timeout=8000)
+                await self._page.wait_for_selector(stop_sel, state="visible", timeout=4000)
                 saw_stop = True
             except Exception:
                 gave_up_stop_at = time.time()  # selector didn't match — track when we gave up
@@ -429,14 +434,14 @@ class BrowserBridge:
                 try:
                     btn = await self._page.query_selector(copy_sel)
                     if btn and await btn.is_visible():
-                        await asyncio.sleep(0.2)
-                        if await self._response_text_stable(timeout=2.0):
+                        await asyncio.sleep(0.1)
+                        if await self._response_text_stable(timeout=1.0):
                             return await self._read_last_response()
                 except Exception:
                     pass
 
                 # Not visible — brief settle, then check if stop reappeared
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.1)
                 try:
                     btn = await self._page.query_selector(stop_sel)
                     if btn and await btn.is_visible():
@@ -451,7 +456,7 @@ class BrowserBridge:
                 if not saw_stop and gave_up_stop_at and (time.time() - gave_up_stop_at) > 15:
                     break
                 if not saw_stop:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
                     continue
                 await asyncio.sleep(0.2)
                 return await self._read_last_response()
@@ -479,14 +484,14 @@ class BrowserBridge:
         except Exception:
             before = ""
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.15)
         last_len = len(before)
         stable = 0
         while time.time() < deadline:
             try:
                 current = await self._page.inner_text("body")
             except Exception:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
             cur_len = len(current)
             if cur_len > len(before) + 10 and cur_len == last_len:
