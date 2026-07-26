@@ -32,7 +32,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style as PTKStyle
 from prompt_toolkit.shortcuts import clear as clear_screen
 
-from browser import BrowserBridge, PERPLEXITY_MODELS
+from browser import BrowserBridge
 from tools import ToolExecutor
 from session import Session
 from agent_core import AgentLoop
@@ -80,7 +80,7 @@ class AgentShell:
             await self.bridge.select_model(model)
 
         # Perplexity: kill Pro search so LLM doesn't see built-in tools
-        await self.bridge.disable_pro_search()
+        # await self.bridge.disable_pro_search()
 
         self.agent = AgentLoop(self.bridge, self.tools, self.config)
         console.print("[dim]Priming system prompt...[/]")

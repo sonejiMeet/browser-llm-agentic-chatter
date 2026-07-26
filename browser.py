@@ -1,689 +1,1017 @@
 """
-browser.py - Playwright wrapper for driving web LLM chats.
-Handles typing messages, reading responses, session persistence, and
-model selection for multi-model providers like Perplexity.
+browser.py — Playwright wrapper for browser-hosted LLM chats.
+
+The bridge treats each prompt as a transaction:
+
+    send_message()
+        -> capture the prior assistant-response fingerprint
+        -> submit
+        -> continuously observe the latest response
+        -> complete immediately when a NEW response is stable
+
+Important DeepSeek detail:
+DeepSeek may temporarily remove/recreate response DOM nodes while it starts
+generating. Therefore response-node counts are not transaction identity.
+The previous last-response text is the baseline; a transaction starts only
+when the current last-response text differs from that baseline.
 """
+
+from __future__ import annotations
 
 import asyncio
 import platform
 import re
 import time
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from typing import Optional
 
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+)
+
+
+# ── timings ────────────────────────────────────────────────────────
+
+# Poll the DOM frequently while a transaction is active.
+POLL_INTERVAL_SECONDS = 0.05
+
+# A new response is accepted after it has not changed for this duration.
+TEXT_STABLE_SECONDS = 0.35
+
+# Maximum wait for a full LLM transaction.
+DEFAULT_RESPONSE_TIMEOUT_SECONDS = 300.0
+
+# Used only by the clipboard fallback.
+CLIPBOARD_SETTLE_SECONDS = 0.12
+
+
+# ── provider selectors ─────────────────────────────────────────────
 
 SELECTORS = {
     "chatgpt": {
-        "input": 'div[contenteditable="true"].ProseMirror, #prompt-textarea, div[contenteditable="true"][id="prompt-textarea"]',
-        "submit": 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="Send"]',
-        "response": "div[data-message-author-role='assistant'], div.agent-turn",
-        "stop_button": 'button[data-testid="stop-button"], button[aria-label="Stop generating"]',
-        "new_chat": 'a[href="/"], button:has-text("New chat"), a:has-text("New chat")',
+        "input": (
+            'div[contenteditable="true"].ProseMirror, '
+            '#prompt-textarea, '
+            'div[contenteditable="true"][id="prompt-textarea"]'
+        ),
+        "submit": (
+            'button[data-testid="send-button"], '
+            'button[aria-label="Send prompt"], '
+            'button[aria-label="Send"]'
+        ),
+        "response": (
+            "div[data-message-author-role='assistant'], "
+            "div.agent-turn"
+        ),
+        "stop_button": (
+            'button[data-testid="stop-button"], '
+            'button[aria-label="Stop generating"]'
+        ),
+        "new_chat": (
+            'a[href="/"], '
+            'button:has-text("New chat"), '
+            'a:has-text("New chat")'
+        ),
         "copy_btn": 'button[aria-label="Copy"]',
     },
     "claude": {
-        "input": 'div[contenteditable="true"].ProseMirror, div[contenteditable="true"]',
-        "submit": 'button[aria-label="Send Message"], button[aria-label="Send message"]',
-        "response": "div.font-claude-message, div[data-is-streaming], div.assistant-message",
-        "stop_button": 'button[aria-label="Stop"], button[aria-label="Stop response"]',
-        "new_chat": 'button:has-text("New chat"), a:has-text("Start new chat")',
-        "copy_btn": 'button[aria-label="Copy response"], button[aria-label="Copy"]',
+        "input": (
+            'div[contenteditable="true"].ProseMirror, '
+            'div[contenteditable="true"]'
+        ),
+        "submit": (
+            'button[aria-label="Send Message"], '
+            'button[aria-label="Send message"]'
+        ),
+        "response": (
+            "div.font-claude-message, "
+            "div[data-is-streaming], "
+            "div.assistant-message"
+        ),
+        "stop_button": (
+            'button[aria-label="Stop"], '
+            'button[aria-label="Stop response"]'
+        ),
+        "new_chat": (
+            'button:has-text("New chat"), '
+            'a:has-text("Start new chat")'
+        ),
+        "copy_btn": (
+            'button[aria-label="Copy response"], '
+            'button[aria-label="Copy"]'
+        ),
     },
     "gemini": {
-        "input": 'div[contenteditable="true"], rich-textarea div[contenteditable="true"]',
-        "submit": 'button[aria-label="Send message"], button[aria-label="Send"]',
-        "response": "model-response, .model-response-text, message-content",
+        "input": (
+            'div[contenteditable="true"], '
+            'rich-textarea div[contenteditable="true"]'
+        ),
+        "submit": (
+            'button[aria-label="Send message"], '
+            'button[aria-label="Send"]'
+        ),
+        "response": (
+            "model-response, "
+            ".model-response-text, "
+            "message-content"
+        ),
         "stop_button": 'button[aria-label="Stop"]',
         "new_chat": 'button:has-text("New chat")',
-        "copy_btn": 'button[aria-label="Copy"], button[data-action="copy"]',
+        "copy_btn": (
+            'button[aria-label="Copy"], '
+            'button[data-action="copy"]'
+        ),
     },
     "perplexity": {
-        "input": '#ask-input',
+        "input": "#ask-input",
         "submit": 'button[aria-label="Use voice mode"]',
-        "response": "div.prose, div[data-testid='answer'], div.answer-content",
+        "response": (
+            "div.prose, "
+            "div[data-testid='answer'], "
+            "div.answer-content"
+        ),
         "stop_button": 'button[aria-label="Stop generating"]',
         "new_chat": 'a[aria-label="New"]',
         "copy_btn": 'button[aria-label="Copy"]',
-        "model_btn": 'div[data-ask-input-container="true"] button[aria-haspopup="menu"]',
+        "model_btn": (
+            'div[data-ask-input-container="true"] '
+            'button[aria-haspopup="menu"]'
+        ),
         "model_dropdown": 'div[role="menu"]',
-        "model_option": 'div[role="menu"] div[role="menuitemradio"]',
+        "model_option": (
+            'div[role="menu"] '
+            'div[role="menuitemradio"]'
+        ),
     },
     "deepseek": {
         "input": 'textarea[placeholder="Message DeepSeek"]',
-        # Use the Enter key method instead of clicking a button
-        "submit": None,  # We'll handle submission via keyboard in code
-        "response": "div.ds-markdown, div[class*='markdown']",
-        "stop_button": 'button[aria-label="Stop"], div[role="button"] svg[data-icon="stop"]',
+        "submit": None,
+        "response": (
+            "div.ds-markdown, "
+            "div[class*='markdown']"
+        ),
+        "stop_button": (
+            'button[aria-label="Stop"], '
+            'div[role="button"] svg[data-icon="stop"]'
+        ),
         "new_chat": 'div._5a8ac7a:has-text("New chat")',
-        "copy_btn": 'button[aria-label="Copy"], div[role="button"]:has-text("Copy")',
+        "copy_btn": (
+            'button[aria-label="Copy"], '
+            'div[role="button"]:has-text("Copy")'
+        ),
         "model_selector": 'div[role="radiogroup"]',
-        "model_option": 'div[data-model-type="expert"], div[data-model-type="instant"], div[data-model-type="vision"]',
-        "model_selected": 'div[data-model-type][aria-checked="true"]',
-    }
+        "model_option": (
+            'div[data-model-type="expert"], '
+            'div[data-model-type="instant"], '
+            'div[data-model-type="vision"]'
+        ),
+        "model_selected": (
+            'div[data-model-type][aria-checked="true"]'
+        ),
+    },
 }
 
+
 PERPLEXITY_MODELS = [
-    "Sonar", "Sonar Pro", "Sonar Reasoning",
-    "GPT-4o", "GPT-4o Mini",
-    "Claude 3.5 Sonnet", "Claude 3 Opus",
+    "Sonar",
+    "Sonar Pro",
+    "Sonar Reasoning",
+    "GPT-4o",
+    "GPT-4o Mini",
+    "Claude 3.5 Sonnet",
+    "Claude 3 Opus",
     "Gemini 2.0 Flash",
     "Grok-2",
 ]
 
-# Perplexity Pro-search toggle — must disable so LLM doesn't see built-in tools
-PERPLEXITY_PRO_SELECTOR = (
-    'button:has-text("Pro"), '
-    '[data-testid="pro-toggle"], '
-    'label:has-text("Pro"), '
-    'div[role="switch"][aria-label*="Pro"]'
-)
 
+# ── transaction state ──────────────────────────────────────────────
+
+class TransactionState(Enum):
+    IDLE = auto()
+    SENT = auto()
+    STREAMING = auto()
+    COMPLETE = auto()
+    ERROR = auto()
+
+
+@dataclass
+class ChatTransaction:
+    state: TransactionState = TransactionState.IDLE
+    text: str = ""
+    started_at: float = 0.0
+    completed_at: float = 0.0
+    saw_stop_button: bool = False
+    error: str = ""
+    snapshots: list[tuple[float, int]] = field(
+        default_factory=list
+    )
+
+    @property
+    def duration_ms(self) -> int:
+        if not self.started_at:
+            return 0
+
+        end = self.completed_at or time.monotonic()
+        return int((end - self.started_at) * 1000)
+
+    @property
+    def done(self) -> bool:
+        return self.state in {
+            TransactionState.COMPLETE,
+            TransactionState.ERROR,
+        }
+
+
+# ── browser bridge ─────────────────────────────────────────────────
 
 class BrowserBridge:
     def __init__(self, config: dict):
         self.provider = config.get("provider", "chatgpt")
         self.url = config["urls"][self.provider]
-        self.user_data_dir = Path(config.get("user_data_dir", "./browser_profile")).resolve()
+
+        self.user_data_dir = Path(
+            config.get("user_data_dir", "./browser_profile")
+        ).resolve()
+
         self.headless = config.get("headless", False)
         self.browser_type = config.get("browser", "chromium")
-        self.selectors = SELECTORS.get(self.provider, SELECTORS["chatgpt"])
-        self.model = config.get("model", None)
+        self.selectors = SELECTORS.get(
+            self.provider,
+            SELECTORS["chatgpt"],
+        )
+        self.model = config.get("model")
+
         self._playwright = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
-        self._is_mac = platform.system() == "Darwin"
-        self._mod = "Meta" if self._is_mac else "Control"
+
+        self._mod = (
+            "Meta"
+            if platform.system() == "Darwin"
+            else "Control"
+        )
+
+        self._transaction: Optional[ChatTransaction] = None
+
+        # The prior final assistant response is the transaction baseline.
+        # This is intentionally text-based, not count-based.
+        self._pre_send_response_text = ""
+        self._pre_send_response_count = 0
+
+        self.debug = config.get("debug_transactions", True)
+        self._transaction_id = 0
+
+    # ── diagnostics ───────────────────────────────────────────────
+
+    def _debug(self, message: str) -> None:
+        if not self.debug:
+            return
+
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[tx:{self._transaction_id:03d}] "
+            f"{message}",
+            flush=True,
+        )
+
+    # ── lifecycle ─────────────────────────────────────────────────
 
     async def start(self) -> Page:
-        """Launch browser with persistent profile."""
         self._playwright = await async_playwright().start()
-        launcher = getattr(self._playwright, self.browser_type)
+
+        launcher = getattr(
+            self._playwright,
+            self.browser_type,
+        )
+
         self._context = await launcher.launch_persistent_context(
             user_data_dir=str(self.user_data_dir),
             headless=self.headless,
             args=["--disable-blink-features=AutomationControlled"],
             viewport={"width": 1280, "height": 900},
         )
-        await self._context.grant_permissions(["clipboard-read", "clipboard-write"])
-        # Reuse existing tab if present (faster, less profile thrash)
+
+        await self._context.grant_permissions(
+            ["clipboard-read", "clipboard-write"]
+        )
+
         if self._context.pages:
             self._page = self._context.pages[0]
         else:
             self._page = await self._context.new_page()
-        await self._page.goto(self.url, wait_until="domcontentloaded")
+
+        await self._page.goto(
+            self.url,
+            wait_until="domcontentloaded",
+        )
+
         return self._page
 
-    async def ensure_logged_in(self, timeout_seconds: int = 120) -> bool:
+    async def close(self) -> None:
+        if self._context:
+            await self._context.close()
+            self._context = None
+
+        if self._playwright:
+            await self._playwright.stop()
+            self._playwright = None
+
+    async def ensure_logged_in(
+        self,
+        timeout_seconds: int = 120,
+    ) -> bool:
         try:
             await self._page.wait_for_selector(
-                self.selectors["input"], timeout=timeout_seconds * 1000
+                self.selectors["input"],
+                timeout=timeout_seconds * 1000,
             )
             return True
         except Exception:
-            print(f"\n[!] Chat input not found. Log in manually at {self.url}")
-            print("    Press Enter here when ready...")
-            await asyncio.get_event_loop().run_in_executor(None, input)
+            print(
+                f"\n[!] Chat input not found at {self.url}. "
+                "Log in manually, then press Enter."
+            )
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                input,
+            )
             return True
 
-    async def select_model(self, model_name: str) -> bool:
-        """For providers with model selectors (Perplexity dropdown, DeepSeek radio)."""
-        if self.provider not in ("perplexity", "deepseek"):
-            return False
+    async def new_chat(self) -> None:
+        selector = self.selectors.get("new_chat")
 
-        # ── Perplexity: dropdown-based ─────────────────────────────
+        if not selector:
+            return
+
+        try:
+            await self._page.click(selector, timeout=5000)
+            await asyncio.sleep(0.25)
+        except Exception:
+            pass
+
+    # ── model selection ───────────────────────────────────────────
+
+    async def select_model(self, model_name: str) -> bool:
         if self.provider == "perplexity":
             return await self._select_model_perplexity(model_name)
 
-        # ── DeepSeek: radiogroup-based ────────────────────────────
         if self.provider == "deepseek":
             return await self._select_model_deepseek(model_name)
 
         return False
 
-    async def _select_model_perplexity(self, model_name: str) -> bool:
-        """Select a model from Perplexity's dropdown."""
+    async def _select_model_perplexity(
+        self,
+        model_name: str,
+    ) -> bool:
         try:
-            btn_sel = self.selectors.get("model_btn")
-            btn = await self._page.query_selector(btn_sel)
-            if not btn:
+            button = await self._page.query_selector(
+                self.selectors["model_btn"]
+            )
+
+            if not button:
                 return False
-            # Check if already selected
-            current_label = await btn.get_attribute("aria-label")
-            if model_name.lower() in (current_label or "").lower():
+
+            current = await button.get_attribute("aria-label")
+
+            if model_name.lower() in (current or "").lower():
                 return True
-            await btn.click()
-            await asyncio.sleep(0.3)
-            # Find the dropdown menu
-            dropdown_sel = self.selectors.get("model_dropdown")
-            dropdown = await self._page.query_selector(dropdown_sel)
-            if not dropdown:
-                dropdown = await self._page.query_selector('div[role="menu"]:not([hidden])')
-            if not dropdown:
-                return False
-            # Find matching option
-            option_sel = self.selectors.get("model_option")
-            options = await dropdown.query_selector_all(option_sel)
-            for opt in options:
-                text = await opt.inner_text()
-                if model_name.lower() in text.lower():
-                    await opt.click()
-                    await asyncio.sleep(0.2)
+
+            await button.click()
+
+            dropdown = await self._page.wait_for_selector(
+                self.selectors["model_dropdown"],
+                timeout=3000,
+            )
+
+            options = await dropdown.query_selector_all(
+                self.selectors["model_option"]
+            )
+
+            for option in options:
+                label = await option.inner_text()
+
+                if model_name.lower() in label.lower():
+                    await option.click()
                     print(f"  [model] Perplexity: {model_name}")
                     return True
-            # Broad fallback
-            all_opts = await self._page.query_selector_all(
-                f'div[role="menuitemradio"]:has-text("{model_name}")'
-            )
-            if all_opts:
-                await all_opts[0].click()
-                await asyncio.sleep(0.2)
-                print(f"  [model] Perplexity: {model_name}")
-                return True
-            return False
-        except Exception as e:
-            print(f"  [model] Perplexity selection failed: {e}")
+
             return False
 
-    async def _select_model_deepseek(self, model_name: str) -> bool:
-        """DeepSeek: radiogroup with data-model-type options."""
-        group_sel = self.selectors.get("model_selector")
-        option_sel = self.selectors.get("model_option")
-        if not group_sel or not option_sel:
+        except Exception as exc:
+            print(f"  [model] Perplexity selection failed: {exc}")
             return False
+
+    async def _select_model_deepseek(
+        self,
+        model_name: str,
+    ) -> bool:
         try:
-            group = await self._page.query_selector(group_sel)
+            group = await self._page.query_selector(
+                self.selectors["model_selector"]
+            )
+
             if not group:
                 return False
-            # Check if already selected
-            selected_sel = self.selectors.get("model_selected")
-            if selected_sel:
-                current = await self._page.query_selector(selected_sel)
-                if current:
-                    cur_type = await current.get_attribute("data-model-type")
-                    if cur_type and model_name.lower() in cur_type.lower():
-                        return True  # already on desired model
-            # Find and click the target option
-            options = await self._page.query_selector_all(option_sel)
-            for opt in options:
-                mtype = await opt.get_attribute("data-model-type") or ""
-                text = await opt.inner_text()
-                if model_name.lower() in mtype.lower() or model_name.lower() in text.lower():
-                    await opt.click()
-                    await asyncio.sleep(0.3)
+
+            selected = await self._page.query_selector(
+                self.selectors["model_selected"]
+            )
+
+            if selected:
+                current_type = await selected.get_attribute(
+                    "data-model-type"
+                )
+
+                if (
+                    current_type
+                    and model_name.lower()
+                    in current_type.lower()
+                ):
+                    return True
+
+            options = await group.query_selector_all(
+                self.selectors["model_option"]
+            )
+
+            for option in options:
+                option_type = (
+                    await option.get_attribute("data-model-type")
+                    or ""
+                )
+                label = await option.inner_text()
+
+                if (
+                    model_name.lower() in option_type.lower()
+                    or model_name.lower() in label.lower()
+                ):
+                    await option.click()
                     print(f"  [model] DeepSeek: {model_name}")
                     return True
-            return False
-        except Exception as e:
-            print(f"  [model] DeepSeek selection failed: {e}")
+
             return False
 
-    async def _response_text_stable(self, timeout: float = 2.0) -> bool:
-        """Return True if the last response element's text has grown beyond
-        its initial state AND stopped changing for *timeout* seconds.
-        Old/stale text that never changed is NOT considered stable."""
-        resp_sel = self.selectors["response"]
-        deadline = time.time() + timeout
-        last = ""
-        stable_since = time.time()
-        initial_len = -1  # -1 = not yet captured
-        while time.time() < deadline:
-            try:
-                msgs = await self._page.query_selector_all(resp_sel)
-                if not msgs:
-                    await asyncio.sleep(0.1)
-                    continue
-                text = await msgs[-1].evaluate("el => el.textContent")
-                if initial_len < 0:
-                    initial_len = len(text)
-                if text == last:
-                    if len(text) >= initial_len and time.time() - stable_since >= timeout:
-                        return True
-                else:
-                    last = text
-                    stable_since = time.time()
-            except Exception:
-                pass
-            await asyncio.sleep(0.15)
-        return len(last) >= initial_len  # grew or stayed same? accept. shrunk? reject.
-
-    async def disable_pro_search(self) -> bool:
-        """Turn off Perplexity Pro search toggle if it's on.
-        Pro search enables built-in tools that confuse our marker protocol."""
-        if self.provider != "perplexity":
+        except Exception as exc:
+            print(f"  [model] DeepSeek selection failed: {exc}")
             return False
+
+    # ── DOM snapshots ─────────────────────────────────────────────
+
+    async def _response_snapshot(
+        self,
+    ) -> tuple[int, str]:
+        """
+        Return response-node count and text from the final response node.
+
+        Count is debug information only. It is not trusted for DeepSeek
+        transaction identity because DeepSeek changes this count while
+        hydrating and replacing markdown nodes.
+        """
         try:
-            # Pro toggle is a button/switch — try common selectors
-            for sel in (
-                'button[aria-label*="Pro"]',
-                'button:has-text("Pro")',
-                '[data-testid="pro-toggle"]',
-                'label:has-text("Pro")',
-            ):
-                btn = await self._page.query_selector(sel)
-                if btn:
-                    # Check if it's already off (aria-checked="false")
-                    checked = await btn.get_attribute("aria-checked")
-                    if checked == "false":
-                        return True  # already off
-                    await btn.click()
-                    await asyncio.sleep(0.3)
-                    print("  [perplexity] Pro search disabled")
-                    return True
-            return False
-        except Exception as e:
-            print(f"  [perplexity] Pro toggle failed: {e}")
-            return False
+            nodes = await self._page.query_selector_all(
+                self.selectors["response"]
+            )
 
-    async def new_chat(self):
-        try:
-            sel = self.selectors.get("new_chat")
-            if sel:
-                await self._page.click(sel, timeout=5000)
-                await asyncio.sleep(1.0)
+            if not nodes:
+                return 0, ""
+
+            text = await nodes[-1].evaluate(
+                "element => element.innerText || "
+                "element.textContent || ''"
+            )
+
+            return len(nodes), (text or "").strip()
+
         except Exception:
-            pass
+            return 0, ""
+
+    async def _stop_button_visible(self) -> bool:
+        selector = self.selectors.get("stop_button")
+
+        if not selector:
+            return False
+
+        try:
+            button = await self._page.query_selector(selector)
+            return bool(button and await button.is_visible())
+        except Exception:
+            return False
+
+    async def _copy_button_visible(self) -> bool:
+        selector = self.selectors.get("copy_btn")
+
+        if not selector:
+            return False
+
+        try:
+            buttons = await self._page.query_selector_all(
+                selector
+            )
+
+            return bool(
+                buttons
+                and await buttons[-1].is_visible()
+            )
+        except Exception:
+            return False
+
+    async def _capture_response_baseline(self) -> None:
+        """
+        Capture final assistant text immediately before a send.
+
+        We do not decide that a response started merely because the number
+        of matching response nodes changed. DeepSeek can go 2 -> 1 -> 2
+        while still displaying the old response.
+        """
+        count, text = await self._response_snapshot()
+
+        self._pre_send_response_count = count
+        self._pre_send_response_text = text
+
+    # ── input / sending ───────────────────────────────────────────
 
     async def _focus_input(self) -> None:
-        input_sel = self.selectors["input"]
-        await self._page.wait_for_selector(input_sel, timeout=15000)
-        # Use focus() not click() — clicking can accidentally activate
-        # toggles/search bars if the selector matches a button element.
-        await self._page.focus(input_sel)
-        await asyncio.sleep(0.05)
+        selector = self.selectors["input"]
+
+        await self._page.wait_for_selector(
+            selector,
+            timeout=15000,
+        )
+
+        await self._page.focus(selector)
 
     async def _clear_input(self) -> None:
         await self._page.keyboard.press(f"{self._mod}+a")
         await self._page.keyboard.press("Backspace")
-        await asyncio.sleep(0.05)
 
-    async def _paste_text(self, text: str) -> bool:
-        """Insert full text instantly (clipboard / insertText). Far faster than typing."""
+    async def _insert_text(self, text: str) -> bool:
+        """
+        Insert text instantly through the active contenteditable / textarea.
+
+        Falls back to keyboard input if the page rejects execCommand.
+        """
         try:
-            # Method 1 (best for ProseMirror/React): insertText into focused editor.
-            # This is instantaneous and does not depend on OS clipboard sync.
-            ok = await self._page.evaluate(
-                """(text) => {
-                    const el = document.activeElement;
-                    if (!el) return false;
-                    el.focus();
+            inserted = await self._page.evaluate(
+                """
+                (text) => {
+                    const element = document.activeElement;
 
-                    // Select-all then insert replaces existing content cleanly
-                    try { document.execCommand('selectAll', false, null); } catch (e) {}
-
-                    try {
-                        if (document.execCommand('insertText', false, text)) {
-                            const t = (el.innerText || el.value || '');
-                            // Accept if a substantial portion landed (editors may trim)
-                            return t.length >= Math.min(text.length, 20) * 0.5;
-                        }
-                    } catch (e) {}
-
-                    // Method 2: synthetic paste event with DataTransfer
-                    try {
-                        const dt = new DataTransfer();
-                        dt.setData('text/plain', text);
-                        const evt = new ClipboardEvent('paste', {
-                            clipboardData: dt,
-                            bubbles: true,
-                            cancelable: true,
-                        });
-                        el.dispatchEvent(evt);
-                        const t = (el.innerText || el.value || '');
-                        if (t.length >= Math.min(text.length, 20) * 0.5) return true;
-                    } catch (e) {}
-
-                    // Method 3: direct value for plain <textarea>
-                    if ('value' in el && el.tagName === 'TEXTAREA') {
-                        el.value = text;
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        return true;
+                    if (!element) {
+                        return false;
                     }
-                    return false;
-                }""",
+
+                    element.focus();
+
+                    try {
+                        document.execCommand("selectAll", false, null);
+
+                        const success = document.execCommand(
+                            "insertText",
+                            false,
+                            text
+                        );
+
+                        const value = (
+                            element.innerText ||
+                            element.value ||
+                            ""
+                        );
+
+                        return success && value.length > 0;
+                    } catch (_) {
+                        return false;
+                    }
+                }
+                """,
                 text,
             )
-            if ok:
-                return True
 
-            # Method 4: OS clipboard + Ctrl/Meta+V (helps some providers)
-            try:
-                await self._context.grant_permissions(
-                    ["clipboard-read", "clipboard-write"]
-                )
-            except Exception:
-                pass
+            return bool(inserted)
 
-            # Write via a temporary textarea + execCommand('copy') so the
-            # system clipboard is actually populated (navigator.clipboard
-            # alone is flaky under automation).
-            copied = await self._page.evaluate(
-                """(text) => {
-                    const ta = document.createElement('textarea');
-                    ta.value = text;
-                    ta.style.position = 'fixed';
-                    ta.style.left = '-9999px';
-                    document.body.appendChild(ta);
-                    ta.focus();
-                    ta.select();
-                    let ok = false;
-                    try { ok = document.execCommand('copy'); } catch (e) {}
-                    document.body.removeChild(ta);
-                    return ok;
-                }""",
-                text,
-            )
-            if copied:
-                await self._focus_input()
-                await self._clear_input()
-                await self._page.keyboard.press(f"{self._mod}+v")
-                await asyncio.sleep(0.1)
-                has_content = await self._page.evaluate(
-                    """() => {
-                        const el = document.activeElement;
-                        if (!el) return false;
-                        return ((el.innerText || el.value || '').trim().length > 0);
-                    }"""
-                )
-                if has_content:
-                    return True
-
-            return False
-        except Exception as e:
-            print(f"  [browser] paste failed: {e}")
+        except Exception:
             return False
 
-    async def _type_chunked(self, text: str, chunk_size: int = 80) -> None:
-        """Faster fallback than char-by-char: type large chunks with minimal delay."""
-        i = 0
-        n = len(text)
-        while i < n:
-            # Find a clean chunk boundary (prefer newline)
-            end = min(i + chunk_size, n)
-            if end < n:
-                nl = text.rfind("\n", i, end)
-                if nl > i:
-                    end = nl + 1
-            chunk = text[i:end]
-            # keyboard.type handles most chars; shift+enter for newlines in contenteditable
-            if "\n" in chunk:
-                parts = chunk.split("\n")
-                for j, part in enumerate(parts):
-                    if part:
-                        await self._page.keyboard.type(part, delay=0)
-                    if j < len(parts) - 1:
-                        await self._page.keyboard.press("Shift+Enter")
-            else:
-                await self._page.keyboard.type(chunk, delay=0)
-            i = end
+    async def _type_text_fallback(self, text: str) -> None:
+        lines = text.split("\n")
+
+        for index, line in enumerate(lines):
+            if line:
+                await self._page.keyboard.type(line, delay=0)
+
+            if index < len(lines) - 1:
+                await self._page.keyboard.press("Shift+Enter")
 
     async def send_message(self, text: str) -> None:
-        """Send a message to the chat. Uses clipboard paste for speed."""
+        """
+        Submit a browser-chat prompt.
+
+        This only performs the SEND half of a transaction. The caller must
+        invoke wait_for_response() to run the observation/completion phase.
+        """
+        if not self._page:
+            raise RuntimeError(
+                "BrowserBridge.start() was not called"
+            )
+
+        self._transaction_id += 1
+        self._debug(f"SEND begin chars={len(text)}")
+
+        await self._capture_response_baseline()
+
+        self._debug(
+            "baseline captured "
+            f"nodes={self._pre_send_response_count} "
+            f"chars={len(self._pre_send_response_text)}"
+        )
+
         await self._focus_input()
         await self._clear_input()
 
-        # Normalize line endings
         text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-        pasted = await self._paste_text(text)
-        if not pasted:
-            # Fast chunked typing fallback (still much faster than delay=5 char typing)
-            await self._type_chunked(text)
+        inserted = await self._insert_text(text)
 
-        await asyncio.sleep(0.12)
-
-        # Submit
-        submit_sel = self.selectors.get("submit")
-        if submit_sel:
-            try:
-                await self._page.click(submit_sel, timeout=3000)
-            except Exception:
-                await self._page.keyboard.press("Enter")
+        if inserted:
+            self._debug("input inserted via execCommand")
         else:
-            # Provider uses Enter key (e.g. DeepSeek)
-            await asyncio.sleep(0.05)
-            await self._page.keyboard.press("Enter")
+            self._debug("input fallback: keyboard typing")
+            await self._type_text_fallback(text)
 
-    async def wait_for_response(self, timeout_seconds: int = 300) -> str:
-        """Wait for generation to finish. Uses stop/copy button detection
-        for providers with reliable selectors; falls back to text-stability
-        polling for others (DeepSeek, etc.)."""
-        stop_sel = self.selectors.get("stop_button")
-        copy_sel = self.selectors.get("copy_btn")
-        deadline = time.time() + timeout_seconds
+        # Scheduler yield only: this is not an intentional time delay.
+        await asyncio.sleep(0)
 
-        # Providers where button detection is unreliable: use text-stability only
-        if self.provider in ("deepseek",):
-            return await self._wait_for_text_stability(deadline)
+        submit_selector = self.selectors.get("submit")
 
-        if stop_sel and copy_sel:
-            # Wait for initial generation to start
-            saw_stop = False
-            gave_up_stop_at = None  # type: float | None
+        if submit_selector:
             try:
-                await self._page.wait_for_selector(stop_sel, state="visible", timeout=4000)
-                saw_stop = True
-            except Exception:
-                gave_up_stop_at = time.time()  # selector didn't match — track when we gave up
-
-            # Loop: stop-disappear → check Copy → if stop reappears, loop again
-            while time.time() < deadline:
-                # Wait for stop button to disappear
-                try:
-                    remaining = max(1, deadline - time.time())
-                    await self._page.wait_for_selector(
-                        stop_sel, state="hidden", timeout=remaining * 1000
-                    )
-                except Exception:
-                    pass
-
-                # Copy button visible? → full response rendered.
-                try:
-                    btn = await self._page.query_selector(copy_sel)
-                    if btn and await btn.is_visible():
-                        await asyncio.sleep(0.1)
-                        if await self._response_text_stable(timeout=1.0):
-                            return await self._read_last_response()
-                except Exception:
-                    pass
-
-                # Not visible — brief settle, then check if stop reappeared
-                await asyncio.sleep(0.1)
-                try:
-                    btn = await self._page.query_selector(stop_sel)
-                    if btn and await btn.is_visible():
-                        saw_stop = True
-                        continue
-                except Exception:
-                    pass
-
-                # Neither stop nor copy visible.
-                # If we never saw stop AND gave up >15s ago, fall through
-                # to text-stability (selector probably doesn't match this provider).
-                if not saw_stop and gave_up_stop_at and (time.time() - gave_up_stop_at) > 15:
-                    break
-                if not saw_stop:
-                    await asyncio.sleep(0.2)
-                    continue
-                await asyncio.sleep(0.2)
-                return await self._read_last_response()
-
-            return await self._read_last_response()
-
-        # Fallback: text-stability polling (no stop/copy selectors available)
-        if stop_sel:
-            try:
-                await self._page.wait_for_selector(stop_sel, state="visible", timeout=8000)
-            except Exception:
-                pass
-            try:
-                remaining = max(1, deadline - time.time())
-                await self._page.wait_for_selector(
-                    stop_sel, state="hidden", timeout=remaining * 1000
+                await self._page.click(
+                    submit_selector,
+                    timeout=3000,
                 )
-                await asyncio.sleep(0.2)
-                return await self._read_last_response()
-            except Exception:
-                pass
+                self._debug("submit click completed")
+            except Exception as exc:
+                self._debug(
+                    f"submit click failed ({exc}); using Enter"
+                )
+                await self._page.keyboard.press("Enter")
+                self._debug("Enter submit completed")
+        else:
+            await self._page.keyboard.press("Enter")
+            self._debug("Enter submit completed")
 
-        try:
-            before = await self._page.inner_text("body")
-        except Exception:
-            before = ""
+        self._transaction = ChatTransaction(
+            state=TransactionState.SENT,
+            started_at=time.monotonic(),
+        )
 
-        await asyncio.sleep(0.15)
-        last_len = len(before)
-        stable = 0
-        while time.time() < deadline:
-            try:
-                current = await self._page.inner_text("body")
-            except Exception:
-                await asyncio.sleep(0.05)
-                continue
-            cur_len = len(current)
-            if cur_len > len(before) + 10 and cur_len == last_len:
-                stable += 1
-                if stable >= 2:
-                    break
-            elif cur_len != last_len:
-                stable = 0
-                last_len = cur_len
-            await asyncio.sleep(0.1)
+        self._debug("SEND complete state=SENT")
 
-        return await self._read_last_response()
+    # ── completion ────────────────────────────────────────────────
 
-    async def _wait_for_text_stability(self, deadline: float) -> str:
-        """Text-stability polling for providers without reliable stop/copy
-        buttons (DeepSeek). Requires text to have grown beyond the initial
-        snapshot AND remained stable for ~0.5s to avoid capturing mid-stream."""
-        try:
-            before = await self._page.inner_text("body")
-        except Exception:
-            before = ""
-        initial_len = len(before)
-        last_len = initial_len
-        stable_since = 0.0  # timestamp when stability began
-        while time.time() < deadline:
-            try:
-                current = await self._page.inner_text("body")
-            except Exception:
-                await asyncio.sleep(0.05)
-                continue
-            cur_len = len(current)
-            now = time.time()
-            if cur_len > last_len:
-                # Still growing — reset
-                last_len = cur_len
-                stable_since = 0.0
-                await asyncio.sleep(0.08)
-            elif cur_len == last_len and cur_len > initial_len + 200:
-                # Same length AND has grown meaningfully — track stability
-                if stable_since == 0.0:
+    async def wait_for_response(
+        self,
+        timeout_seconds: int = 300,
+    ) -> str:
+        """
+        Wait for one NEW assistant response.
+
+        A response starts only when latest_response_text differs from the
+        response text captured before send_message(). Once started, a stable
+        response completes immediately after TEXT_STABLE_SECONDS.
+
+        For normal providers, a stop-button disappearance is an extra strong
+        signal. For DeepSeek, it is optional: stable new output is sufficient.
+        """
+        if not self._page:
+            raise RuntimeError(
+                "BrowserBridge.start() was not called"
+            )
+
+        transaction = self._transaction
+
+        if transaction is None:
+            transaction = ChatTransaction(
+                state=TransactionState.SENT,
+                started_at=time.monotonic(),
+            )
+            self._transaction = transaction
+
+        timeout_seconds = float(timeout_seconds)
+        deadline = time.monotonic() + timeout_seconds
+
+        baseline_text = self._pre_send_response_text
+
+        last_text = ""
+        stable_since: Optional[float] = None
+        response_started = False
+        stop_disappeared = False
+        last_debug_at = 0.0
+
+        self._debug(
+            f"WAIT begin timeout={timeout_seconds:.0f}s "
+            f"baseline_chars={len(baseline_text)}"
+        )
+
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+
+            count, current_text = await self._response_snapshot()
+            stop_visible = await self._stop_button_visible()
+
+            # This is the key fix:
+            #
+            # Never use count > old_count as the primary "new response"
+            # condition. DeepSeek's count can become 1 while it still shows
+            # the old text. A response starts only after content differs.
+            current_is_new = bool(
+                current_text
+                and current_text != baseline_text
+            )
+
+            previous_state = transaction.state
+
+            if stop_visible:
+                if not transaction.saw_stop_button:
+                    self._debug("stop button appeared")
+
+                transaction.saw_stop_button = True
+
+                if transaction.state == TransactionState.SENT:
+                    transaction.state = TransactionState.STREAMING
+
+            elif transaction.saw_stop_button:
+                if not stop_disappeared:
+                    self._debug("stop button disappeared")
+
+                stop_disappeared = True
+
+            if current_is_new and not response_started:
+                response_started = True
+                transaction.state = TransactionState.STREAMING
+                last_text = current_text
+                stable_since = now
+
+                self._debug(
+                    "NEW RESPONSE detected "
+                    f"nodes={count} chars={len(current_text)}"
+                )
+
+            elif response_started:
+                if current_text != last_text:
+                    self._debug(
+                        "response changed "
+                        f"chars={len(last_text)}->{len(current_text)}"
+                    )
+
+                    last_text = current_text
                     stable_since = now
-                elif now - stable_since >= 0.5:
-                    break  # stable for 0.5s
-                await asyncio.sleep(0.06)
-            else:
-                # Same length but hasn't grown enough, or shrunk
-                await asyncio.sleep(0.08)
-        return await self._read_last_response()
+                    transaction.snapshots.append(
+                        (now, len(current_text))
+                    )
+
+            stable_for = (
+                now - stable_since
+                if stable_since is not None
+                else 0.0
+            )
+
+            text_is_stable = (
+                response_started
+                and bool(last_text)
+                and stable_for >= TEXT_STABLE_SECONDS
+            )
+
+            if transaction.state != previous_state:
+                self._debug(
+                    f"state transition "
+                    f"{previous_state.name}->"
+                    f"{transaction.state.name}"
+                )
+
+            # One concise diagnostic heartbeat per second.
+            if now - last_debug_at >= 1.0:
+                self._debug(
+                    f"WAIT state={transaction.state.name} "
+                    f"nodes={count} "
+                    f"chars={len(current_text)} "
+                    f"new={current_is_new} "
+                    f"stop={stop_visible} "
+                    f"stable={stable_for:.2f}s"
+                )
+
+                last_debug_at = now
+
+            # Strong completion signal for providers that expose Stop.
+            if (
+                response_started
+                and transaction.saw_stop_button
+                and stop_disappeared
+                and text_is_stable
+            ):
+                self._debug(
+                    "COMPLETE stop disappeared + stable response"
+                )
+                transaction.state = TransactionState.COMPLETE
+                break
+
+            # Universal completion signal:
+            #
+            # Once a new answer exists and its DOM text has been unchanged
+            # for 350ms, return it. This is particularly important for
+            # DeepSeek, whose Stop selector is unreliable or absent.
+            if text_is_stable:
+                if self.provider == "deepseek":
+                    self._debug(
+                        "COMPLETE DeepSeek new response stable"
+                    )
+                    transaction.state = TransactionState.COMPLETE
+                    break
+
+                # For the other providers, Copy visibility is confirmation.
+                # If unavailable, stable new text still wins after 1 second.
+                copy_visible = await self._copy_button_visible()
+
+                if copy_visible or stable_for >= 1.0:
+                    reason = (
+                        "copy visible"
+                        if copy_visible
+                        else "stable for 1.0s"
+                    )
+
+                    self._debug(
+                        f"COMPLETE new response stable ({reason})"
+                    )
+
+                    transaction.state = TransactionState.COMPLETE
+                    break
+
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+        if transaction.state != TransactionState.COMPLETE:
+            self._debug(
+                f"TIMEOUT after {timeout_seconds:.0f}s; "
+                f"started={response_started} "
+                f"chars={len(last_text)}"
+            )
+
+            transaction.state = TransactionState.COMPLETE
+
+        transaction.completed_at = time.monotonic()
+
+        self._debug("reading final response")
+
+        # Prefer the tracked text because it is guaranteed to be the NEW
+        # response, rather than reading a DOM node that DeepSeek may replace.
+        if last_text:
+            transaction.text = self._strip_thinking(last_text)
+        else:
+            transaction.text = await self._read_last_response()
+
+        self._debug(
+            f"WAIT complete "
+            f"elapsed={transaction.duration_ms}ms "
+            f"final_chars={len(transaction.text)}"
+        )
+
+        return transaction.text
+
+    # ── response reading ──────────────────────────────────────────
 
     async def _read_last_response(self) -> str:
-        """Read the last assistant response. Tries Copy button first for
-        markdown formatting, but falls back to innerText if the clipboard
-        lost our [[[ markers (ChatGPT sometimes strips them on copy)."""
-        copy_sel = self.selectors.get("copy_btn")
-        resp_sel = self.selectors["response"]
+        """
+        Read the visible final response.
 
-        # Helper: read innerText from last response element
-        async def _read_innertext():
-            try:
-                msgs = await self._page.query_selector_all(resp_sel)
-                if msgs:
-                    t = await msgs[-1].evaluate("el => el.innerText || el.textContent")
-                    return (t or "").strip()
-            except Exception:
-                pass
-            return ""
+        The transaction loop normally returns its tracked stable text. This
+        method is primarily a timeout and external-call fallback.
+        """
+        _, text = await self._response_snapshot()
 
-        # Method 1: click copy button → read clipboard
-        if copy_sel:
-            try:
-                text = await self._page.evaluate("""
-                    async (sel) => {
-                        const btns = [...document.querySelectorAll(sel)];
-                        if (!btns.length) return null;
-                        btns[btns.length - 1].click();
-                        await new Promise(r => setTimeout(r, 800));
-                        try {
-                            let t = await navigator.clipboard.readText();
-                            if (t && t.trim()) return t;
-                            await new Promise(r => setTimeout(r, 600));
-                            t = await navigator.clipboard.readText();
-                            if (t && t.trim()) return t;
-                        } catch (e) { return null; }
-                        return null;
-                    }
-                """, copy_sel)
-                if text and text.strip():
-                    # Verify [[[ markers survived the copy — ChatGPT may strip them
-                    if "[[[" in text:
-                        return self._strip_thinking(text.strip())
-                    # Markers lost — fall through to innerText
-            except Exception:
-                pass
-
-        # Method 2: innerText (preserves [[[ brackets ChatGPT copy drops)
-        text = await _read_innertext()
         if text:
             return self._strip_thinking(text)
 
-        # Method 3: textContent (absolute fallback)
-        try:
-            messages = await self._page.query_selector_all(resp_sel)
-            if messages:
-                t = await messages[-1].evaluate("el => el.textContent")
-                return self._strip_thinking((t or "").strip())
-        except Exception as e:
-            return f"[ERROR reading response: {e}]"
+        copied = await self._copy_last_response()
+
+        if copied:
+            return self._strip_thinking(copied)
+
         return "[No response found]"
+
+    async def _copy_last_response(self) -> str:
+        selector = self.selectors.get("copy_btn")
+
+        if not selector:
+            return ""
+
+        try:
+            text = await self._page.evaluate(
+                """
+                async ({selector, delayMs}) => {
+                    const buttons = [
+                        ...document.querySelectorAll(selector)
+                    ];
+
+                    const button = buttons.at(-1);
+
+                    if (!button) {
+                        return "";
+                    }
+
+                    button.click();
+
+                    await new Promise(resolve => {
+                        setTimeout(resolve, delayMs);
+                    });
+
+                    try {
+                        return await navigator.clipboard.readText();
+                    } catch (_) {
+                        return "";
+                    }
+                }
+                """,
+                {
+                    "selector": selector,
+                    "delayMs": int(
+                        CLIPBOARD_SETTLE_SECONDS * 1000
+                    ),
+                },
+            )
+
+            return (text or "").strip()
+
+        except Exception:
+            return ""
 
     @staticmethod
     def _strip_thinking(text: str) -> str:
-        """Remove DeepSeek R1 thinking blocks from copied response text.
-        The Copy button grabs the 'thinking' section before the actual answer.
-        Strips everything before a --- separator line."""
+        """
+        Strip DeepSeek reasoning if Copy/DOM contains a reasoning divider.
+
+        Does not alter [[[FILE]]], [[[SHELL]]], [[[READ]]], or [[[END]]].
+        """
         if not text:
-            return text
-        # Pattern: "---" on its own line separates thinking from answer
-        parts = re.split(r'\n---+\n', text, maxsplit=1)
+            return ""
+
+        parts = re.split(r"\n---+\n", text, maxsplit=1)
+
         if len(parts) == 2 and len(parts[1].strip()) > 20:
             return parts[1].strip()
-        # Triple-newline with substantial text before it
-        idx = text.find("\n\n\n")
-        if idx > 200:
-            return text[idx:].strip()
-        return text
+
+        return text.strip()
+
+    # ── convenience API ───────────────────────────────────────────
+
+    async def transact(
+        self,
+        text: str,
+        timeout_seconds: int = 300,
+    ) -> ChatTransaction:
+        """Perform one complete send-and-wait browser transaction."""
+        await self.send_message(text)
+
+        result = await self.wait_for_response(
+            timeout_seconds=timeout_seconds
+        )
+
+        if self._transaction:
+            self._transaction.text = result
+            return self._transaction
+
+        return ChatTransaction(
+            state=TransactionState.COMPLETE,
+            text=result,
+            completed_at=time.monotonic(),
+        )
 
     async def get_full_conversation(self) -> str:
         try:
-            all_msgs = await self._page.query_selector_all(
+            messages = await self._page.query_selector_all(
                 "article[data-testid^='conversation-turn-'], "
-                "div.agent-turn, div[data-message-author-role], div.prose"
+                "div.agent-turn, "
+                "div[data-message-author-role], "
+                "div.prose"
             )
-            parts = []
-            for m in all_msgs:
+
+            parts: list[str] = []
+
+            for message in messages:
                 try:
-                    txt = await m.inner_text()
-                    parts.append(txt)
+                    text = (await message.inner_text()).strip()
+
+                    if text:
+                        parts.append(text)
+
                 except Exception:
-                    pass
+                    continue
+
             return "\n\n---\n\n".join(parts)
+
         except Exception:
             return "[Could not read conversation]"
-
-    async def close(self):
-        if self._context:
-            await self._context.close()
-        if self._playwright:
-            await self._playwright.stop()
