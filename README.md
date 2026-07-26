@@ -30,6 +30,10 @@ Inside the REPL:
 | `/history` | Show conversation history |
 | `/changes` | Show file/shell change log |
 | `/provider` | Show current provider/model |
+| `/debug on` | Enable transaction diagnostics |
+| `/debug off` | Disable transaction diagnostics |
+| `/debug status` | Show diagnostic state |
+| `/debug toggle` | Toggle transaction diagnostics |
 | `/exit` | Quit |
 
 `Alt+Enter` for multi-line input.

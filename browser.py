@@ -1,19 +1,20 @@
 """
-browser.py — Playwright wrapper for browser-hosted LLM chats.
+browser.py - Playwright wrapper for browser-hosted LLM chats.
 
-The bridge treats each prompt as a transaction:
+Each prompt is a transaction:
 
     send_message()
-        -> capture the prior assistant-response fingerprint
-        -> submit
-        -> continuously observe the latest response
-        -> complete immediately when a NEW response is stable
+        -> capture the previous assistant-response fingerprint
+        -> submit the prompt
+        -> observe the newest response
+        -> return only after a new response is complete
 
-Important DeepSeek detail:
-DeepSeek may temporarily remove/recreate response DOM nodes while it starts
-generating. Therefore response-node counts are not transaction identity.
-The previous last-response text is the baseline; a transaction starts only
-when the current last-response text differs from that baseline.
+DeepSeek-specific behavior:
+- Extract raw source from <pre><code> blocks without rendered language,
+  Copy, or Download controls.
+- Detect rejected requests such as:
+      Messages too frequent. Try again later.
+  including the message rendered directly below the user's sent prompt.
 """
 
 from __future__ import annotations
@@ -28,35 +29,43 @@ from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import (
-    async_playwright,
     Browser,
     BrowserContext,
     Page,
+    async_playwright,
 )
 
 
-# ── timings ────────────────────────────────────────────────────────
-
-# Poll the DOM frequently while a transaction is active.
 POLL_INTERVAL_SECONDS = 0.05
-
-# A new response is accepted after it has not changed for this duration.
 TEXT_STABLE_SECONDS = 0.35
-
-# Maximum wait for a full LLM transaction.
 DEFAULT_RESPONSE_TIMEOUT_SECONDS = 300.0
-
-# Used only by the clipboard fallback.
 CLIPBOARD_SETTLE_SECONDS = 0.12
 
 
-# ── provider selectors ─────────────────────────────────────────────
+DEEPSEEK_REJECTION_PATTERN = re.compile(
+    r"(?i)"
+    r"("
+    r"messages?\s+too\s+frequent\.?\s*"
+    r"try\s+again\s+later\.?"
+    r"|"
+    r"too\s+many\s+messages\.?"
+    r"|"
+    r"requests?\s+too\s+frequent\.?"
+    r"|"
+    r"request\s+too\s+frequent\.?"
+    r"|"
+    r"rate\s+limit(?:\s+exceeded)?\.?"
+    r"|"
+    r"you\s+are\s+sending\s+messages\s+too\s+quickly\.?"
+    r")"
+)
+
 
 SELECTORS = {
     "chatgpt": {
         "input": (
             'div[contenteditable="true"].ProseMirror, '
-            '#prompt-textarea, '
+            "#prompt-textarea, "
             'div[contenteditable="true"][id="prompt-textarea"]'
         ),
         "submit": (
@@ -129,15 +138,25 @@ SELECTORS = {
     },
     "perplexity": {
         "input": "#ask-input",
-        "submit": 'button[aria-label="Use voice mode"]',
+        "submit": None,
         "response": (
-            "div.prose, "
             "div[data-testid='answer'], "
-            "div.answer-content"
+            "div.answer-content, "
+            "div.prose"
         ),
-        "stop_button": 'button[aria-label="Stop generating"]',
+        "stop_button": (
+            'button[aria-label*="stop" i], '
+            'button[title*="stop" i], '
+            'button[data-testid*="stop" i], '
+            '[role="button"][aria-label*="stop" i], '
+            '[role="button"][title*="stop" i]'
+        ),
         "new_chat": 'a[aria-label="New"]',
-        "copy_btn": 'button[aria-label="Copy"]',
+        "copy_btn": (
+            'button[aria-label*="copy" i], '
+            'button[title*="copy" i], '
+            'button[data-testid*="copy" i]'
+        ),
         "model_btn": (
             'div[data-ask-input-container="true"] '
             'button[aria-haspopup="menu"]'
@@ -163,6 +182,13 @@ SELECTORS = {
         "copy_btn": (
             'button[aria-label="Copy"], '
             'div[role="button"]:has-text("Copy")'
+        ),
+        "rejection": (
+            "span._1ce76f5, "
+            "[role='alert'], "
+            "[role='status'], "
+            "[aria-live='assertive'], "
+            "[aria-live='polite']"
         ),
         "model_selector": 'div[role="radiogroup"]',
         "model_option": (
@@ -190,14 +216,16 @@ PERPLEXITY_MODELS = [
 ]
 
 
-# ── transaction state ──────────────────────────────────────────────
-
 class TransactionState(Enum):
     IDLE = auto()
     SENT = auto()
     STREAMING = auto()
     COMPLETE = auto()
     ERROR = auto()
+
+
+class ProviderRateLimitError(RuntimeError):
+    """Raised when a provider rejects a submitted prompt."""
 
 
 @dataclass
@@ -228,10 +256,11 @@ class ChatTransaction:
         }
 
 
-# ── browser bridge ─────────────────────────────────────────────────
-
 class BrowserBridge:
+    """Browser session and completion-aware LLM transaction bridge."""
+
     def __init__(self, config: dict):
+        self.config = config
         self.provider = config.get("provider", "chatgpt")
         self.url = config["urls"][self.provider]
 
@@ -239,8 +268,37 @@ class BrowserBridge:
             config.get("user_data_dir", "./browser_profile")
         ).resolve()
 
-        self.headless = config.get("headless", False)
+        self.headless = bool(config.get("headless", False))
         self.browser_type = config.get("browser", "chromium")
+
+        self.window_width = int(
+            config.get("window_width", 1440)
+        )
+        self.window_height = int(
+            config.get("window_height", 1000)
+        )
+
+        default_message_limit = (
+            12_000
+            if self.provider == "perplexity"
+            else 25_000
+        )
+
+        self.max_browser_message_chars = int(
+            config.get(
+                "max_browser_message_chars",
+                default_message_limit,
+            )
+        )
+
+        self.perplexity_settle_seconds = float(
+            config.get("perplexity_settle_seconds", 2.0)
+        )
+
+        self.perplexity_no_stop_settle_seconds = float(
+            config.get("perplexity_no_stop_settle_seconds", 4.0)
+        )
+
         self.selectors = SELECTORS.get(
             self.provider,
             SELECTORS["chatgpt"],
@@ -260,17 +318,27 @@ class BrowserBridge:
 
         self._transaction: Optional[ChatTransaction] = None
 
-        # The prior final assistant response is the transaction baseline.
-        # This is intentionally text-based, not count-based.
         self._pre_send_response_text = ""
         self._pre_send_response_count = 0
+        self._pre_send_copy_count = 0
 
-        self.debug = bool(config.get("debug_transactions", False))
+        self.debug = bool(
+            config.get("debug_transactions", False)
+        )
         self._transaction_id = 0
 
-    # ── diagnostics ───────────────────────────────────────────────
+    @property
+    def page(self) -> Page:
+        """Return the active page or fail before startup."""
+        if self._page is None:
+            raise RuntimeError(
+                "BrowserBridge.start() was not called"
+            )
+
+        return self._page
 
     def _debug(self, message: str) -> None:
+        """Print transaction diagnostics when enabled."""
         if not self.debug:
             return
 
@@ -281,9 +349,8 @@ class BrowserBridge:
             flush=True,
         )
 
-    # ── lifecycle ─────────────────────────────────────────────────
-
     async def start(self) -> Page:
+        """Launch the persistent browser profile and visit the provider."""
         self._playwright = await async_playwright().start()
 
         launcher = getattr(
@@ -291,11 +358,35 @@ class BrowserBridge:
             self.browser_type,
         )
 
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+        ]
+
+        launch_options: dict = {
+            "user_data_dir": str(self.user_data_dir),
+            "headless": self.headless,
+            "args": launch_args,
+        }
+
+        if self.headless:
+            launch_options["viewport"] = {
+                "width": self.window_width,
+                "height": self.window_height,
+            }
+        else:
+            launch_args.extend(
+                [
+                    (
+                        "--window-size="
+                        f"{self.window_width},{self.window_height}"
+                    ),
+                    "--start-maximized",
+                ]
+            )
+            launch_options["no_viewport"] = True
+
         self._context = await launcher.launch_persistent_context(
-            user_data_dir=str(self.user_data_dir),
-            headless=self.headless,
-            args=["--disable-blink-features=AutomationControlled"],
-            viewport={"width": 1280, "height": 900},
+            **launch_options
         )
 
         await self._context.grant_permissions(
@@ -312,12 +403,21 @@ class BrowserBridge:
             wait_until="domcontentloaded",
         )
 
+        self._debug(
+            "browser started "
+            f"provider={self.provider} "
+            f"headless={self.headless} "
+            f"window={self.window_width}x{self.window_height}"
+        )
+
         return self._page
 
     async def close(self) -> None:
+        """Close the browser context and Playwright runtime."""
         if self._context:
             await self._context.close()
             self._context = None
+            self._page = None
 
         if self._playwright:
             await self._playwright.stop()
@@ -327,38 +427,42 @@ class BrowserBridge:
         self,
         timeout_seconds: int = 120,
     ) -> bool:
+        """Wait for the chat input, allowing manual login."""
         try:
-            await self._page.wait_for_selector(
+            await self.page.wait_for_selector(
                 self.selectors["input"],
                 timeout=timeout_seconds * 1000,
             )
             return True
+
         except Exception:
             print(
                 f"\n[!] Chat input not found at {self.url}. "
                 "Log in manually, then press Enter."
             )
+
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 input,
             )
+
             return True
 
     async def new_chat(self) -> None:
+        """Open a fresh provider conversation when available."""
         selector = self.selectors.get("new_chat")
 
         if not selector:
             return
 
         try:
-            await self._page.click(selector, timeout=5000)
+            await self.page.click(selector, timeout=5000)
             await asyncio.sleep(0.25)
         except Exception:
             pass
 
-    # ── model selection ───────────────────────────────────────────
-
     async def select_model(self, model_name: str) -> bool:
+        """Select a supported provider model."""
         if self.provider == "perplexity":
             return await self._select_model_perplexity(model_name)
 
@@ -372,7 +476,7 @@ class BrowserBridge:
         model_name: str,
     ) -> bool:
         try:
-            button = await self._page.query_selector(
+            button = await self.page.query_selector(
                 self.selectors["model_btn"]
             )
 
@@ -386,7 +490,7 @@ class BrowserBridge:
 
             await button.click()
 
-            dropdown = await self._page.wait_for_selector(
+            dropdown = await self.page.wait_for_selector(
                 self.selectors["model_dropdown"],
                 timeout=3000,
             )
@@ -414,14 +518,14 @@ class BrowserBridge:
         model_name: str,
     ) -> bool:
         try:
-            group = await self._page.query_selector(
+            group = await self.page.query_selector(
                 self.selectors["model_selector"]
             )
 
             if not group:
                 return False
 
-            selected = await self._page.query_selector(
+            selected = await self.page.query_selector(
                 self.selectors["model_selected"]
             )
 
@@ -432,8 +536,7 @@ class BrowserBridge:
 
                 if (
                     current_type
-                    and model_name.lower()
-                    in current_type.lower()
+                    and model_name.lower() in current_type.lower()
                 ):
                     return True
 
@@ -462,103 +565,459 @@ class BrowserBridge:
             print(f"  [model] DeepSeek selection failed: {exc}")
             return False
 
-    # ── DOM snapshots ─────────────────────────────────────────────
+    @staticmethod
+    def _deepseek_rejection_message(text: str) -> str:
+        """Extract a known DeepSeek request-rejection message."""
+        if not text:
+            return ""
 
-    async def _response_snapshot(
-        self,
-    ) -> tuple[int, str]:
-        """
-        Return response-node count and text from the final response node.
+        normalized = " ".join(text.split()).strip()
 
-        Count is debug information only. It is not trusted for DeepSeek
-        transaction identity because DeepSeek changes this count while
-        hydrating and replacing markdown nodes.
+        match = DEEPSEEK_REJECTION_PATTERN.search(
+            normalized
+        )
+
+        if not match:
+            return ""
+
+        return match.group(0).strip()
+    
+    
+    async def _deepseek_visible_rejection(self) -> str:
         """
+        Return a visible DeepSeek request-rejection message.
+
+        DeepSeek displays this below the sent user message, commonly as:
+
+            <span class="_1ce76f5">
+                Messages too frequent. Try again later.
+            </span>
+
+        Do not depend on the hashed CSS class: use Playwright text locators,
+        which match rendered text anywhere in the active DeepSeek page.
+        """
+        if self.provider != "deepseek":
+            return ""
+
+        messages = (
+            "Messages too frequent. Try again later.",
+            "Messages too frequent",
+            "Too many messages",
+            "Requests too frequent",
+            "Request too frequent",
+            "Rate limit exceeded",
+            "Rate limit",
+            "Try again later",
+        )
+
+        for message in messages:
+            try:
+                locator = self.page.get_by_text(
+                    message,
+                    exact=False,
+                )
+
+                count = await locator.count()
+
+                for index in range(count):
+                    candidate = locator.nth(index)
+
+                    if await candidate.is_visible():
+                        text = await candidate.inner_text()
+                        detected = self._deepseek_rejection_message(
+                            text
+                        )
+
+                        if detected:
+                            return detected
+
+            except Exception:
+                continue
+
         try:
-            nodes = await self._page.query_selector_all(
+            page_text = await self.page.locator("body").inner_text()
+
+            return self._deepseek_rejection_message(
+                page_text or ""
+            )
+
+        except Exception as exc:
+            self._debug(
+                f"DeepSeek rejection text scan failed: {exc}"
+            )
+            return ""
+        
+
+    async def _raise_if_deepseek_rejected(
+        self,
+        response_text: str = "",
+    ) -> None:
+        """
+        End the transaction when DeepSeek visibly rejects the submitted prompt.
+
+        This checks both the assistant response text and the error displayed
+        directly underneath the outgoing user message.
+        """
+        if self.provider != "deepseek":
+            return
+
+        message = self._deepseek_rejection_message(response_text)
+
+        if not message:
+            message = await self._deepseek_visible_rejection()
+
+        if not message:
+            return
+
+        error = (
+            "DeepSeek rejected this request: "
+            f"{message}. The agent stopped; wait and try again."
+        )
+
+        if self._transaction:
+            self._transaction.state = TransactionState.ERROR
+            self._transaction.error = error
+            self._transaction.completed_at = time.monotonic()
+
+        self._debug(f"PROVIDER REJECTION: {message}")
+
+        raise ProviderRateLimitError(error)
+
+    async def _deepseek_response_text(
+        self,
+        response_node,
+    ) -> str:
+        """Extract DeepSeek response text without code-block UI chrome."""
+        try:
+            text = await response_node.evaluate(
+                """
+                (response) => {
+                    const clone = response.cloneNode(true);
+
+                    const controls = clone.querySelectorAll(
+                        [
+                            "button",
+                            "[role='button']",
+                            "svg",
+                            "path",
+                            "[aria-label*='copy' i]",
+                            "[aria-label*='download' i]",
+                            "[title*='copy' i]",
+                            "[title*='download' i]",
+                        ].join(", ")
+                    );
+
+                    for (const element of controls) {
+                        element.remove();
+                    }
+
+                    const codeBlocks = clone.querySelectorAll("pre");
+
+                    for (const pre of codeBlocks) {
+                        const code = pre.querySelector("code");
+                        const rawCode = (
+                            code?.textContent ||
+                            pre.textContent ||
+                            ""
+                        );
+
+                        const replacement = document.createElement("div");
+
+                        replacement.setAttribute(
+                            "data-browser-agent-raw-code",
+                            "true"
+                        );
+
+                        replacement.textContent = (
+                            "\\n" + rawCode + "\\n"
+                        );
+
+                        pre.replaceWith(replacement);
+                    }
+
+                    return clone.innerText || clone.textContent || "";
+                }
+                """
+            )
+
+            return self._clean_deepseek_file_payloads(text or "")
+
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _clean_deepseek_file_payloads(text: str) -> str:
+        """Remove DeepSeek code chrome inside FILE payloads only."""
+        if not text:
+            return ""
+
+        language_labels = {
+            "assembly",
+            "bash",
+            "c",
+            "cpp",
+            "csharp",
+            "css",
+            "dart",
+            "dockerfile",
+            "go",
+            "html",
+            "java",
+            "javascript",
+            "js",
+            "json",
+            "jsx",
+            "kotlin",
+            "lua",
+            "markdown",
+            "md",
+            "odin",
+            "perl",
+            "php",
+            "powershell",
+            "ps1",
+            "py",
+            "python",
+            "r",
+            "ruby",
+            "rs",
+            "rust",
+            "scala",
+            "sh",
+            "shell",
+            "sql",
+            "swift",
+            "toml",
+            "ts",
+            "typescript",
+            "tsx",
+            "xml",
+            "yaml",
+            "yml",
+        }
+
+        chrome_labels = {
+            "copy",
+            "copy code",
+            "copy to clipboard",
+            "download",
+            "download code",
+        }
+
+        pattern = re.compile(
+            r"(?P<start>\[\[\[FILE\b[^\]]*\]\]\])"
+            r"(?P<body>.*?)"
+            r"(?P<end>\[\[\[END\]\]\])",
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        def clean_match(match: re.Match) -> str:
+            lines = match.group("body").splitlines(
+                keepends=True
+            )
+            index = 0
+
+            while index < len(lines) and not lines[index].strip():
+                index += 1
+
+            while index < len(lines):
+                label = lines[index].strip().lower()
+
+                if label in language_labels or label in chrome_labels:
+                    index += 1
+                    continue
+
+                break
+
+            body = "".join(lines[index:])
+
+            if body and not body.startswith("\n"):
+                body = "\n" + body
+
+            if body and not body.endswith("\n"):
+                body += "\n"
+
+            return (
+                match.group("start")
+                + body
+                + match.group("end")
+            )
+
+        return pattern.sub(clean_match, text).strip()
+
+    async def _response_snapshot(self) -> tuple[int, str]:
+        """Return visible response count and newest response text."""
+        try:
+            nodes = await self.page.query_selector_all(
                 self.selectors["response"]
             )
 
-            if not nodes:
+            visible_nodes = []
+
+            for node in nodes:
+                try:
+                    if await node.is_visible():
+                        visible_nodes.append(node)
+                except Exception:
+                    continue
+
+            if not visible_nodes:
                 return 0, ""
 
-            text = await nodes[-1].evaluate(
-                "element => element.innerText || "
-                "element.textContent || ''"
-            )
+            newest_node = visible_nodes[-1]
 
-            return len(nodes), (text or "").strip()
+            if self.provider == "deepseek":
+                text = await self._deepseek_response_text(
+                    newest_node
+                )
+            else:
+                text = await newest_node.evaluate(
+                    "element => element.innerText || "
+                    "element.textContent || ''"
+                )
+
+            return len(visible_nodes), (text or "").strip()
 
         except Exception:
             return 0, ""
 
+    async def _copy_button_count(self) -> int:
+        """Return the count of visible Copy controls."""
+        selector = self.selectors.get("copy_btn")
+
+        if not selector:
+            return 0
+
+        try:
+            buttons = await self.page.query_selector_all(selector)
+            count = 0
+
+            for button in buttons:
+                if await button.is_visible():
+                    count += 1
+
+            return count
+
+        except Exception:
+            return 0
+
     async def _stop_button_visible(self) -> bool:
+        """Return whether the standard provider Stop control is visible."""
         selector = self.selectors.get("stop_button")
 
         if not selector:
             return False
 
         try:
-            button = await self._page.query_selector(selector)
+            button = await self.page.query_selector(selector)
             return bool(button and await button.is_visible())
         except Exception:
             return False
 
-    async def _copy_button_visible(self) -> bool:
-        selector = self.selectors.get("copy_btn")
-
-        if not selector:
-            return False
-
+    async def _perplexity_generation_active(self) -> bool:
+        """Detect Perplexity generation across changing interface variants."""
         try:
-            buttons = await self._page.query_selector_all(
-                selector
-            )
-
             return bool(
-                buttons
-                and await buttons[-1].is_visible()
+                await self.page.evaluate(
+                    """
+                    () => {
+                        const visible = (element) => {
+                            const style = getComputedStyle(element);
+                            const rect = element.getBoundingClientRect();
+
+                            return (
+                                style.display !== "none" &&
+                                style.visibility !== "hidden" &&
+                                style.opacity !== "0" &&
+                                rect.width > 0 &&
+                                rect.height > 0
+                            );
+                        };
+
+                        const busyElements = [
+                            ...document.querySelectorAll(
+                                '[aria-busy="true"]'
+                            ),
+                        ];
+
+                        if (busyElements.some(visible)) {
+                            return true;
+                        }
+
+                        const controls = [
+                            ...document.querySelectorAll(
+                                "button, [role='button'], [data-testid]"
+                            ),
+                        ];
+
+                        return controls.some((element) => {
+                            if (!visible(element)) {
+                                return false;
+                            }
+
+                            const label = [
+                                element.getAttribute("aria-label"),
+                                element.getAttribute("title"),
+                                element.getAttribute("data-testid"),
+                                element.getAttribute("data-state"),
+                                element.textContent,
+                            ]
+                                .filter(Boolean)
+                                .join(" ")
+                                .toLowerCase();
+
+                            return (
+                                /\\bstop\\b/.test(label) ||
+                                /\\bcancel\\b/.test(label) ||
+                                /stop.generat/.test(label) ||
+                                /generating/.test(label) ||
+                                /searching/.test(label)
+                            );
+                        });
+                    }
+                    """
+                )
             )
         except Exception:
             return False
 
-    async def _capture_response_baseline(self) -> None:
-        """
-        Capture final assistant text immediately before a send.
+    async def _generation_active(self) -> bool:
+        """Use the special detector only for Perplexity."""
+        if self.provider == "perplexity":
+            return await self._perplexity_generation_active()
 
-        We do not decide that a response started merely because the number
-        of matching response nodes changed. DeepSeek can go 2 -> 1 -> 2
-        while still displaying the old response.
-        """
+        return await self._stop_button_visible()
+
+    async def _copy_button_visible(self) -> bool:
+        """Return whether any Copy control is visible."""
+        return await self._copy_button_count() > 0
+
+    async def _capture_response_baseline(self) -> None:
+        """Capture assistant-response and Copy-control state before submit."""
         count, text = await self._response_snapshot()
 
         self._pre_send_response_count = count
         self._pre_send_response_text = text
-
-    # ── input / sending ───────────────────────────────────────────
+        self._pre_send_copy_count = await self._copy_button_count()
 
     async def _focus_input(self) -> None:
-        selector = self.selectors["input"]
-
-        await self._page.wait_for_selector(
-            selector,
+        """Focus the provider input."""
+        await self.page.wait_for_selector(
+            self.selectors["input"],
             timeout=15000,
         )
 
-        await self._page.focus(selector)
+        await self.page.focus(self.selectors["input"])
 
     async def _clear_input(self) -> None:
-        await self._page.keyboard.press(f"{self._mod}+a")
-        await self._page.keyboard.press("Backspace")
+        """Clear text from the focused provider input."""
+        await self.page.keyboard.press(f"{self._mod}+a")
+        await self.page.keyboard.press("Backspace")
 
     async def _insert_text(self, text: str) -> bool:
-        """
-        Insert text instantly through the active contenteditable / textarea.
-
-        Falls back to keyboard input if the page rejects execCommand.
-        """
+        """Insert text directly into the active editable control."""
         try:
-            inserted = await self._page.evaluate(
+            inserted = await self.page.evaluate(
                 """
                 (text) => {
                     const element = document.activeElement;
@@ -570,7 +1029,11 @@ class BrowserBridge:
                     element.focus();
 
                     try {
-                        document.execCommand("selectAll", false, null);
+                        document.execCommand(
+                            "selectAll",
+                            false,
+                            null
+                        );
 
                         const success = document.execCommand(
                             "insertText",
@@ -599,25 +1062,31 @@ class BrowserBridge:
             return False
 
     async def _type_text_fallback(self, text: str) -> None:
+        """Type text if direct insertion is rejected by the frontend."""
         lines = text.split("\n")
 
         for index, line in enumerate(lines):
             if line:
-                await self._page.keyboard.type(line, delay=0)
+                await self.page.keyboard.type(line, delay=0)
 
             if index < len(lines) - 1:
-                await self._page.keyboard.press("Shift+Enter")
+                await self.page.keyboard.press("Shift+Enter")
 
     async def send_message(self, text: str) -> None:
-        """
-        Submit a browser-chat prompt.
-
-        This only performs the SEND half of a transaction. The caller must
-        invoke wait_for_response() to run the observation/completion phase.
-        """
+        """Submit a prompt without waiting for its assistant response."""
         if not self._page:
             raise RuntimeError(
                 "BrowserBridge.start() was not called"
+            )
+
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        if len(text) > self.max_browser_message_chars:
+            raise ValueError(
+                "Refusing to send an oversized browser message: "
+                f"{len(text):,} characters exceeds the configured "
+                f"limit of {self.max_browser_message_chars:,}. "
+                "Reduce or truncate tool feedback first."
             )
 
         self._transaction_id += 1
@@ -628,13 +1097,12 @@ class BrowserBridge:
         self._debug(
             "baseline captured "
             f"nodes={self._pre_send_response_count} "
-            f"chars={len(self._pre_send_response_text)}"
+            f"chars={len(self._pre_send_response_text)} "
+            f"copies={self._pre_send_copy_count}"
         )
 
         await self._focus_input()
         await self._clear_input()
-
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
 
         inserted = await self._insert_text(text)
 
@@ -644,27 +1112,31 @@ class BrowserBridge:
             self._debug("input fallback: keyboard typing")
             await self._type_text_fallback(text)
 
-        # Scheduler yield only: this is not an intentional time delay.
         await asyncio.sleep(0)
 
-        submit_selector = self.selectors.get("submit")
-
-        if submit_selector:
-            try:
-                await self._page.click(
-                    submit_selector,
-                    timeout=3000,
-                )
-                self._debug("submit click completed")
-            except Exception as exc:
-                self._debug(
-                    f"submit click failed ({exc}); using Enter"
-                )
-                await self._page.keyboard.press("Enter")
-                self._debug("Enter submit completed")
+        if self.provider == "perplexity":
+            await self.page.keyboard.press("Enter")
+            self._debug("Perplexity Enter submit completed")
         else:
-            await self._page.keyboard.press("Enter")
-            self._debug("Enter submit completed")
+            submit_selector = self.selectors.get("submit")
+
+            if submit_selector:
+                try:
+                    await self.page.click(
+                        submit_selector,
+                        timeout=3000,
+                    )
+                    self._debug("submit click completed")
+
+                except Exception as exc:
+                    self._debug(
+                        f"submit click failed ({exc}); using Enter"
+                    )
+                    await self.page.keyboard.press("Enter")
+                    self._debug("Enter submit completed")
+            else:
+                await self.page.keyboard.press("Enter")
+                self._debug("Enter submit completed")
 
         self._transaction = ChatTransaction(
             state=TransactionState.SENT,
@@ -673,22 +1145,11 @@ class BrowserBridge:
 
         self._debug("SEND complete state=SENT")
 
-    # ── completion ────────────────────────────────────────────────
-
     async def wait_for_response(
         self,
-        timeout_seconds: int = 300,
+        timeout_seconds: int = DEFAULT_RESPONSE_TIMEOUT_SECONDS,
     ) -> str:
-        """
-        Wait for one NEW assistant response.
-
-        A response starts only when latest_response_text differs from the
-        response text captured before send_message(). Once started, a stable
-        response completes immediately after TEXT_STABLE_SECONDS.
-
-        For normal providers, a stop-button disappearance is an extra strong
-        signal. For DeepSeek, it is optional: stable new output is sufficient.
-        """
+        """Wait for one new complete assistant response."""
         if not self._page:
             raise RuntimeError(
                 "BrowserBridge.start() was not called"
@@ -705,13 +1166,13 @@ class BrowserBridge:
 
         timeout_seconds = float(timeout_seconds)
         deadline = time.monotonic() + timeout_seconds
-
         baseline_text = self._pre_send_response_text
 
         last_text = ""
         stable_since: Optional[float] = None
         response_started = False
-        stop_disappeared = False
+        generation_seen = False
+        generation_finished = False
         last_debug_at = 0.0
 
         self._debug(
@@ -723,13 +1184,14 @@ class BrowserBridge:
             now = time.monotonic()
 
             count, current_text = await self._response_snapshot()
-            stop_visible = await self._stop_button_visible()
 
-            # This is the key fix:
-            #
-            # Never use count > old_count as the primary "new response"
-            # condition. DeepSeek's count can become 1 while it still shows
-            # the old text. A response starts only after content differs.
+            await self._raise_if_deepseek_rejected(
+                current_text
+            )
+
+            generation_active = await self._generation_active()
+            copy_count = await self._copy_button_count()
+
             current_is_new = bool(
                 current_text
                 and current_text != baseline_text
@@ -737,20 +1199,21 @@ class BrowserBridge:
 
             previous_state = transaction.state
 
-            if stop_visible:
-                if not transaction.saw_stop_button:
-                    self._debug("stop button appeared")
+            if generation_active:
+                if not generation_seen:
+                    self._debug("generation control appeared")
 
+                generation_seen = True
                 transaction.saw_stop_button = True
 
                 if transaction.state == TransactionState.SENT:
                     transaction.state = TransactionState.STREAMING
 
-            elif transaction.saw_stop_button:
-                if not stop_disappeared:
-                    self._debug("stop button disappeared")
+            elif generation_seen:
+                if not generation_finished:
+                    self._debug("generation control disappeared")
 
-                stop_disappeared = True
+                generation_finished = True
 
             if current_is_new and not response_started:
                 response_started = True
@@ -763,18 +1226,18 @@ class BrowserBridge:
                     f"nodes={count} chars={len(current_text)}"
                 )
 
-            elif response_started:
-                if current_text != last_text:
-                    self._debug(
-                        "response changed "
-                        f"chars={len(last_text)}->{len(current_text)}"
-                    )
+            elif response_started and current_text != last_text:
+                self._debug(
+                    "response changed "
+                    f"chars={len(last_text)}->{len(current_text)}"
+                )
 
-                    last_text = current_text
-                    stable_since = now
-                    transaction.snapshots.append(
-                        (now, len(current_text))
-                    )
+                last_text = current_text
+                stable_since = now
+
+                transaction.snapshots.append(
+                    (now, len(current_text))
+                )
 
             stable_for = (
                 now - stable_since
@@ -790,52 +1253,87 @@ class BrowserBridge:
 
             if transaction.state != previous_state:
                 self._debug(
-                    f"state transition "
-                    f"{previous_state.name}->"
-                    f"{transaction.state.name}"
+                    "state transition "
+                    f"{previous_state.name}->{transaction.state.name}"
                 )
 
-            # One concise diagnostic heartbeat per second.
             if now - last_debug_at >= 1.0:
                 self._debug(
                     f"WAIT state={transaction.state.name} "
                     f"nodes={count} "
                     f"chars={len(current_text)} "
                     f"new={current_is_new} "
-                    f"stop={stop_visible} "
+                    f"generating={generation_active} "
+                    f"generation_seen={generation_seen} "
+                    f"copies={copy_count} "
                     f"stable={stable_for:.2f}s"
                 )
 
                 last_debug_at = now
 
-            # Strong completion signal for providers that expose Stop.
-            if (
+            if self.provider == "perplexity":
+                new_copy_button = (
+                    copy_count > self._pre_send_copy_count
+                )
+
+                if (
+                    response_started
+                    and generation_seen
+                    and generation_finished
+                    and text_is_stable
+                    and stable_for >= self.perplexity_settle_seconds
+                ):
+                    self._debug(
+                        "COMPLETE Perplexity generation ended + "
+                        f"stable for {stable_for:.2f}s"
+                    )
+
+                    transaction.state = TransactionState.COMPLETE
+                    break
+
+                if (
+                    response_started
+                    and not generation_seen
+                    and new_copy_button
+                    and not generation_active
+                    and text_is_stable
+                    and stable_for >= (
+                        self.perplexity_no_stop_settle_seconds
+                    )
+                ):
+                    self._debug(
+                        "COMPLETE Perplexity new Copy control + "
+                        f"stable for {stable_for:.2f}s"
+                    )
+
+                    transaction.state = TransactionState.COMPLETE
+                    break
+
+            elif (
                 response_started
-                and transaction.saw_stop_button
-                and stop_disappeared
+                and generation_seen
+                and generation_finished
                 and text_is_stable
             ):
                 self._debug(
                     "COMPLETE stop disappeared + stable response"
                 )
+
                 transaction.state = TransactionState.COMPLETE
                 break
 
-            # Universal completion signal:
-            #
-            # Once a new answer exists and its DOM text has been unchanged
-            # for 350ms, return it. This is particularly important for
-            # DeepSeek, whose Stop selector is unreliable or absent.
-            if text_is_stable:
-                if self.provider == "deepseek":
-                    self._debug(
-                        "COMPLETE DeepSeek new response stable"
-                    )
-                    transaction.state = TransactionState.COMPLETE
-                    break
+            elif (
+                self.provider == "deepseek"
+                and text_is_stable
+            ):
+                self._debug(
+                    "COMPLETE DeepSeek new response stable"
+                )
 
-                # For the other providers, Copy visibility is confirmation.
-                # If unavailable, stable new text still wins after 1 second.
+                transaction.state = TransactionState.COMPLETE
+                break
+
+            elif text_is_stable:
                 copy_visible = await self._copy_button_visible()
 
                 if copy_visible or stable_for >= 1.0:
@@ -846,7 +1344,8 @@ class BrowserBridge:
                     )
 
                     self._debug(
-                        f"COMPLETE new response stable ({reason})"
+                        "COMPLETE new response stable "
+                        f"({reason})"
                     )
 
                     transaction.state = TransactionState.COMPLETE
@@ -855,6 +1354,22 @@ class BrowserBridge:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
         if transaction.state != TransactionState.COMPLETE:
+            transaction.completed_at = time.monotonic()
+
+            if self.provider == "perplexity":
+                transaction.state = TransactionState.ERROR
+                transaction.error = (
+                    "Perplexity did not expose a confirmed completion "
+                    "signal before the response timeout."
+                )
+
+                self._debug(
+                    "ERROR Perplexity completion was not confirmed; "
+                    "refusing possible partial text"
+                )
+
+                raise TimeoutError(transaction.error)
+
             self._debug(
                 f"TIMEOUT after {timeout_seconds:.0f}s; "
                 f"started={response_started} "
@@ -864,11 +1379,8 @@ class BrowserBridge:
             transaction.state = TransactionState.COMPLETE
 
         transaction.completed_at = time.monotonic()
-
         self._debug("reading final response")
 
-        # Prefer the tracked text because it is guaranteed to be the NEW
-        # response, rather than reading a DOM node that DeepSeek may replace.
         if last_text:
             transaction.text = self._strip_thinking(last_text)
         else:
@@ -882,15 +1394,8 @@ class BrowserBridge:
 
         return transaction.text
 
-    # ── response reading ──────────────────────────────────────────
-
     async def _read_last_response(self) -> str:
-        """
-        Read the visible final response.
-
-        The transaction loop normally returns its tracked stable text. This
-        method is primarily a timeout and external-call fallback.
-        """
+        """Read the latest visible response, with Copy fallback."""
         _, text = await self._response_snapshot()
 
         if text:
@@ -899,18 +1404,24 @@ class BrowserBridge:
         copied = await self._copy_last_response()
 
         if copied:
+            if self.provider == "deepseek":
+                copied = self._clean_deepseek_file_payloads(
+                    copied
+                )
+
             return self._strip_thinking(copied)
 
         return "[No response found]"
 
     async def _copy_last_response(self) -> str:
+        """Copy the latest response using the visible provider control."""
         selector = self.selectors.get("copy_btn")
 
         if not selector:
             return ""
 
         try:
-            text = await self._page.evaluate(
+            text = await self.page.evaluate(
                 """
                 async ({selector, delayMs}) => {
                     const buttons = [
@@ -925,7 +1436,7 @@ class BrowserBridge:
 
                     button.click();
 
-                    await new Promise(resolve => {
+                    await new Promise((resolve) => {
                         setTimeout(resolve, delayMs);
                     });
 
@@ -951,11 +1462,7 @@ class BrowserBridge:
 
     @staticmethod
     def _strip_thinking(text: str) -> str:
-        """
-        Strip DeepSeek reasoning if Copy/DOM contains a reasoning divider.
-
-        Does not alter [[[FILE]]], [[[SHELL]]], [[[READ]]], or [[[END]]].
-        """
+        """Strip DeepSeek reasoning separated by a dashed divider."""
         if not text:
             return ""
 
@@ -966,14 +1473,12 @@ class BrowserBridge:
 
         return text.strip()
 
-    # ── convenience API ───────────────────────────────────────────
-
     async def transact(
         self,
         text: str,
-        timeout_seconds: int = 300,
+        timeout_seconds: int = DEFAULT_RESPONSE_TIMEOUT_SECONDS,
     ) -> ChatTransaction:
-        """Perform one complete send-and-wait browser transaction."""
+        """Perform one complete send-and-wait transaction."""
         await self.send_message(text)
 
         result = await self.wait_for_response(
@@ -991,8 +1496,9 @@ class BrowserBridge:
         )
 
     async def get_full_conversation(self) -> str:
+        """Return visible text from the active provider conversation."""
         try:
-            messages = await self._page.query_selector_all(
+            messages = await self.page.query_selector_all(
                 "article[data-testid^='conversation-turn-'], "
                 "div.agent-turn, "
                 "div[data-message-author-role], "
@@ -1007,11 +1513,10 @@ class BrowserBridge:
 
                     if text:
                         parts.append(text)
-
                 except Exception:
                     continue
 
             return "\n\n---\n\n".join(parts)
 
         except Exception:
-            return "[Could not read conversation]"  
+            return "[Could not read conversation]"
