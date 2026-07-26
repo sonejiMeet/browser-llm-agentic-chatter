@@ -321,7 +321,8 @@ class AgentLoop:
         Ask the user to approve mutating actions before they run locally.
 
         Read-only actions (file_read) always pass through. When no `confirm`
-        callback is configured, the plan is executed as-is (auto-approve).
+        callback is configured, or confirmations are disabled in config, the
+        plan is executed as-is (auto-approve).
         """
         if not plan:
             return plan
@@ -336,6 +337,9 @@ class AgentLoop:
             return plan
 
         if self.confirm is None:
+            return plan
+
+        if not self.config.get("confirm_changes", True):
             return plan
 
         decision = await self.confirm(plan)

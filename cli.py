@@ -106,9 +106,7 @@ class AgentShell:
             self.bridge,
             self.tools,
             self.config,
-            confirm=self._confirm_changes
-            if self.config.get("confirm_changes", True)
-            else None,
+            confirm=self._confirm_changes,
         )
 
         with console.status(
@@ -740,6 +738,10 @@ class AgentShell:
             self._handle_debug_command(argument)
             return False
 
+        if command == "/confirm":
+            self._handle_confirm_command(argument)
+            return False
+
         if command == "/help":
             self._show_help()
             return False
@@ -794,13 +796,17 @@ class AgentShell:
 - `/debug off` — Disable transaction diagnostics
 - `/debug status` — Show diagnostic state
 - `/debug toggle` — Toggle transaction diagnostics
+- `/confirm on` — Require approval before writing files / running commands
+- `/confirm off` — Auto-approve all local changes
+- `/confirm status` — Show confirmation state
+- `/confirm toggle` — Toggle confirmation
 - `/exit` — Close the browser and exit
 
 ### Tips
 
 - `Alt+Enter` inserts a newline.
-- Tool calls execute automatically after the model completes a response.
-- Use `/debug on` when diagnosing browser response detection.
+- Tool calls execute after the model completes a response.
+- Use `/confirm off` (or `orbit -y`) for unattended runs.
 """
                 ),
                 title="[bold]Help[/]",
@@ -853,6 +859,47 @@ class AgentShell:
 
         console.print(
             "[yellow]Usage: /debug on | off | toggle | status[/]"
+        )
+
+
+    def _handle_confirm_command(self, argument: str) -> None:
+        """Toggle the local-change confirmation gate at runtime."""
+        enabled = bool(self.config.get("confirm_changes", True))
+
+        if argument in ("", "status"):
+            state = "[green]ON[/]" if enabled else "[dim]OFF[/]"
+            console.print(
+                f"Local-change confirmation: {state}\n"
+                "[dim]/confirm on | off | toggle | status[/]"
+            )
+            return
+
+        if argument in ("on", "true", "1", "yes"):
+            self.config["confirm_changes"] = True
+            console.print(
+                "[green]Local-change confirmation enabled.[/]"
+            )
+            return
+
+        if argument in ("off", "false", "0", "no"):
+            self.config["confirm_changes"] = False
+            console.print(
+                "[dim]Local-change confirmation disabled (auto-approve).[/]"
+            )
+            return
+
+        if argument == "toggle":
+            self.config["confirm_changes"] = not enabled
+            state = (
+                "enabled"
+                if self.config["confirm_changes"]
+                else "disabled (auto-approve)"
+            )
+            console.print(f"Local-change confirmation {state}.")
+            return
+
+        console.print(
+            "[yellow]Usage: /confirm on | off | toggle | status[/]"
         )
 
 
@@ -921,6 +968,17 @@ def main() -> None:
         help="List supported Perplexity models",
     )
     parser.add_argument(
+        "--auto-confirm",
+        "-y",
+        action="store_true",
+        help="Skip change-confirmation prompts (auto-approve file writes/shell)",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Force interactive confirmation even if config disables it",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable browser transaction diagnostics at startup",
@@ -943,6 +1001,12 @@ def main() -> None:
 
     if args.model:
         config["model"] = args.model
+
+    if args.auto_confirm:
+        config["confirm_changes"] = False
+
+    if args.confirm:
+        config["confirm_changes"] = True
 
     if args.debug:
         config["debug_transactions"] = True
