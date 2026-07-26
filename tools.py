@@ -239,12 +239,15 @@ class ToolExecutor:
         """Clear this task's accumulated file and shell changes."""
         self.change_log.clear()
 
-    def execute_tool_calls(self, text: str) -> list[dict[str, Any]]:
+    def plan_tool_calls(self, text: str) -> list[dict[str, Any]]:
         """
-        Parse all complete markers and execute them in their original order.
+        Parse all complete markers without executing them.
 
-        A response can mix FILE, SHELL, and READ blocks; preserving their order
-        allows models to create files, then compile or inspect them.
+        Returns a plan: one dict per marker in original order, each shaped
+        like `{"action": "file_write"|"shell"|"file_read", ...details}`.
+        The caller may inspect and approve/reject each entry before passing
+        the plan to `execute_planned`. This is what enables a user
+        confirmation gate before any local change is made.
         """
         if not text:
             return []
@@ -262,24 +265,76 @@ class ToolExecutor:
 
         calls.sort(key=lambda item: item[0])
 
-        results: list[dict[str, Any]] = []
+        plan: list[dict[str, Any]] = []
 
         for _, kind, match in calls:
             if kind == "file_write":
-                results.append(
-                    self.write_file(
-                        match.group("path"),
-                        match.group("content"),
-                    )
+                plan.append(
+                    {
+                        "action": "file_write",
+                        "path": self._normalize_tool_path(
+                            match.group("path")
+                        ),
+                        "content": match.group("content"),
+                    }
                 )
 
             elif kind == "shell":
-                results.append(self.run_shell(match.group("command")))
+                plan.append(
+                    {"action": "shell", "command": match.group("command")}
+                )
 
             elif kind == "file_read":
-                results.append(self.read_file(match.group("path")))
+                plan.append(
+                    {
+                        "action": "file_read",
+                        "path": self._normalize_tool_path(
+                            match.group("path")
+                        ),
+                    }
+                )
+
+        return plan
+
+    def execute_planned(
+        self, plan: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """
+        Execute a plan produced by `plan_tool_calls`.
+
+        Entries that were rejected (removed) by the caller are simply not
+        present, so they are never executed. File reads are always safe and
+        run unconditionally if present.
+        """
+        results: list[dict[str, Any]] = []
+
+        for entry in plan:
+            action = entry.get("action")
+
+            if action == "file_write":
+                results.append(
+                    self.write_file(
+                        entry["path"],
+                        entry["content"],
+                    )
+                )
+
+            elif action == "shell":
+                results.append(self.run_shell(entry["command"]))
+
+            elif action == "file_read":
+                results.append(self.read_file(entry["path"]))
 
         return results
+
+    def execute_tool_calls(self, text: str) -> list[dict[str, Any]]:
+        """
+        Parse and execute all complete markers in one step (no confirmation).
+
+        Kept for callers that need the old non-interactive behaviour. For the
+        user-confirmation gate, use `plan_tool_calls` + `execute_planned`.
+        """
+        return self.execute_planned(self.plan_tool_calls(text))
 
     def write_file(
         self,

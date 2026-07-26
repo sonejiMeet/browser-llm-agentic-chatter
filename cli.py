@@ -44,6 +44,7 @@ from agent_core import AgentLoop
 from browser import BrowserBridge, PERPLEXITY_MODELS
 from session import Session
 from tools import ToolExecutor
+from rich.prompt import Confirm
 
 
 console = Console()
@@ -66,6 +67,8 @@ _STATUS_MESSAGES = {
     "Sending tool results...": "Sending tool results",
     "No actions found; requesting next action...": "Waiting for next step",
     "Code has no path; requesting a destination...": "Requesting file path",
+    "Local changes declined; asking for an updated plan...":
+        "Awaiting revised plan",
 }
 
 
@@ -99,7 +102,14 @@ class AgentShell:
             ):
                 await self.bridge.select_model(model)
 
-        self.agent = AgentLoop(self.bridge, self.tools, self.config)
+        self.agent = AgentLoop(
+            self.bridge,
+            self.tools,
+            self.config,
+            confirm=self._confirm_changes
+            if self.config.get("confirm_changes", True)
+            else None,
+        )
 
         with console.status(
             "[dim]Preparing agent...[/]",
@@ -193,6 +203,105 @@ class AgentShell:
         )
         console.print()
 
+    async def _confirm_changes(self, plan: list[dict]) -> bool:
+        """
+        Show a pretty Rich confirmation panel and ask the user to approve the
+        planned FILE and SHELL actions before they touch the local machine.
+
+        Returns True to approve every action, False to decline them all.
+        """
+        # Free the terminal so the confirmation panel and prompt render cleanly
+        # instead of being overwritten by the background waiting spinner.
+        self._stop_live()
+
+        mutating = [
+            entry
+            for entry in plan
+            if entry.get("action") in ("file_write", "shell")
+        ]
+        reads = [
+            entry
+            for entry in plan
+            if entry.get("action") == "file_read"
+        ]
+
+        if not mutating and not reads:
+            return True
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column(style="dim", no_wrap=True)
+        table.add_column()
+
+        action_icons = {
+            "file_write": ("✎", "green"),
+            "shell": ("⚡", "yellow"),
+            "file_read": ("📖", "cyan"),
+        }
+
+        for entry in plan:
+            action = entry.get("action", "tool")
+            icon, color = action_icons.get(action, ("▶", "white"))
+
+            if action == "file_write":
+                label = "write"
+                detail = entry.get("path", "?")
+            elif action == "shell":
+                label = "run"
+                cmd = (entry.get("command") or "").strip()
+                detail = cmd if len(cmd) <= 200 else cmd[:197] + "..."
+            else:
+                label = "read"
+                detail = entry.get("path", "?")
+
+            note = (
+                " [dim](approved automatically)[/]"
+                if action == "file_read"
+                else ""
+            )
+
+            table.add_row(
+                f"[{color}]{icon} {label}[/{color}]",
+                "",
+                f"{detail}{note}",
+            )
+
+        console.print()
+        console.print(
+            Panel(
+                table,
+                title="[bold yellow]Approve local changes?[/]",
+                subtitle=(
+                    "[dim]File writes and shell commands require your "
+                    "approval · reads are safe[/]"
+                ),
+                border_style="yellow",
+                box=box.ROUNDED,
+                padding=(1, 2),
+            )
+        )
+
+        try:
+            approved = Confirm.ask(
+                "[bold yellow]Apply these changes[/] "
+                "[dim](y = approve, n = decline)[/]",
+                default=True,
+                console=console,
+            )
+        except (EOFError, KeyboardInterrupt):
+            approved = False
+
+        if approved:
+            console.print(
+                "[dim]✓ Approved — executing actions...[/]\n"
+            )
+        else:
+            console.print(
+                "[dim]✗ Declined — no local changes applied.[/]\n"
+            )
+
+        return approved
+
     async def _process_message(self, text: str) -> None:
         """Run one agent task and render the resulting event stream."""
         if self.agent is None:
@@ -207,7 +316,8 @@ class AgentShell:
         did_work = False
         final_event: Any | None = None
         spinner_message = "Thinking"
-        live: Live | None = None
+        if not hasattr(self, "_live"):
+            self._live: Live | None = None
 
         try:
             async for event in self.agent.run_turn(
@@ -220,23 +330,23 @@ class AgentShell:
                         event.text.rstrip("."),
                     )
 
-                    if live is None:
-                        live = Live(
+                    if self._live is None:
+                        self._live = Live(
                             self._spinner_renderable(spinner_message),
                             console=console,
                             refresh_per_second=12,
                             transient=True,
                         )
-                        live.start()
+                        self._live.start()
                     else:
-                        live.update(
+                        self._live.update(
                             self._spinner_renderable(spinner_message)
                         )
 
                 elif event.kind == "response":
-                    if live is not None:
-                        live.stop()
-                        live = None
+                    if self._live is not None:
+                        self._live.stop()
+                        self._live = None
 
                     clean = event.text.strip()
 
@@ -246,38 +356,38 @@ class AgentShell:
                         self._show_response(clean)
 
                 elif event.kind == "tool_start":
-                    if live is not None:
-                        live.stop()
-                        live = None
+                    if self._live is not None:
+                        self._live.stop()
+                        self._live = None
 
                     did_work = True
                     self._show_tool_start(event)
 
                 elif event.kind == "tool_result":
-                    if live is not None:
-                        live.stop()
-                        live = None
+                    if self._live is not None:
+                        self._live.stop()
+                        self._live = None
 
                     did_work = True
                     self._show_tool_result(event)
 
                 elif event.kind == "error":
-                    if live is not None:
-                        live.stop()
-                        live = None
+                    if self._live is not None:
+                        self._live.stop()
+                        self._live = None
 
                     self._show_error(event.text)
 
                 elif event.kind == "done":
-                    if live is not None:
-                        live.stop()
-                        live = None
+                    if self._live is not None:
+                        self._live.stop()
+                        self._live = None
 
                     final_event = event
 
         finally:
-            if live is not None:
-                live.stop()
+            if self._live is not None:
+                self._live.stop()
 
         if final_event is not None:
             self._show_completion(
@@ -285,6 +395,16 @@ class AgentShell:
                 displayed_response=displayed_response,
                 did_work=did_work,
             )
+
+    def _stop_live(self) -> None:
+        """Stop the transient waiting spinner if it is running."""
+        live = getattr(self, "_live", None)
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:
+                pass
+            self._live = None
 
     def _spinner_renderable(self, message: str) -> Group:
         """Create the transient waiting indicator."""

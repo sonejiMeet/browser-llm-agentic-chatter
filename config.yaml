@@ -50,6 +50,10 @@ tools:
   file_read:
     enabled: true
 
+# Ask for approval before the agent writes files or runs shell commands
+# locally. Reads are always allowed. Set false to run without prompts.
+confirm_changes: true
+
 # System prompt injected at the start of the browser chat session.
 # agent_core.build_system_prompt() appends non-identifying ENVIRONMENT
 # details (OS kind, shell, workspace folder name only — never full paths).

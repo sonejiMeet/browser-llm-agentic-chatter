@@ -248,11 +248,18 @@ class AgentLoop:
         tools: ToolExecutor,
         config: dict,
         max_tool_rounds: int = 25,
+        confirm=None,
     ):
         self.bridge = bridge
         self.tools = tools
         self.config = config
         self.max_tool_rounds = max_tool_rounds
+        # Optional async confirmation gate. When provided, it is awaited with
+        # the parsed plan before any file write or shell command runs. It must
+        # return the (possibly reduced) plan to execute. A truthy return value
+        # that is not a list means "approve all". None/empty list means "reject
+        # all local changes for this turn". Read-only actions are never gated.
+        self.confirm = confirm
         self._primed = False
         self._state: Optional[TurnState] = None
         self._path_requested = False
@@ -301,12 +308,52 @@ class AgentLoop:
 
     def _parse_tools(self, raw: str) -> list[dict]:
         """
-        Parse only the exact raw browser response.
+        Parse only the exact raw browser response into an execution plan.
 
-        ToolExecutor owns FILE code-fence removal. Do not run Markdown cleanup
-        here: that risks changing code before it reaches the file writer.
+        Returns a plan (no side effects). ToolExecutor owns FILE code-fence
+        removal and execution. Do not run Markdown cleanup here: that risks
+        changing code before it reaches the file writer.
         """
-        return self.tools.execute_tool_calls(raw)
+        return self.tools.plan_tool_calls(raw)
+
+    async def _confirm_plan(self, plan: list[dict]) -> list[dict]:
+        """
+        Ask the user to approve mutating actions before they run locally.
+
+        Read-only actions (file_read) always pass through. When no `confirm`
+        callback is configured, the plan is executed as-is (auto-approve).
+        """
+        if not plan:
+            return plan
+
+        mutating = [
+            entry
+            for entry in plan
+            if entry.get("action") in ("file_write", "shell")
+        ]
+
+        if not mutating:
+            return plan
+
+        if self.confirm is None:
+            return plan
+
+        decision = await self.confirm(plan)
+
+        # Truthy non-list => approve everything. List => caller-vetted plan.
+        if decision is True:
+            return plan
+        if decision is False or decision is None:
+            # Reject all local changes but keep reads.
+            return [
+                entry
+                for entry in plan
+                if entry.get("action") == "file_read"
+            ]
+        if isinstance(decision, list):
+            return decision
+
+        return plan
 
     async def run_turn(
         self,
@@ -346,11 +393,11 @@ class AgentLoop:
             return
 
         for round_index in range(self.max_tool_rounds):
-            results = self._parse_tools(last_raw)
+            plan = self._parse_tools(last_raw)
 
             # Guarded recovery for a model response that contains source code
             # but omitted the FILE marker. It never invents a filename.
-            if not results and _looks_like_code(last_raw):
+            if not plan and _looks_like_code(last_raw):
                 path = (
                     _extract_path_from_text(last_raw)
                     or _extract_path_from_text(self._state.task)
@@ -361,7 +408,7 @@ class AgentLoop:
                         "status",
                         f"Recovered unmarked code for {path}",
                     )
-                    results = self.tools.execute_tool_calls(
+                    plan = self.tools.plan_tool_calls(
                         f'[[[FILE path="{path}"]]]\n'
                         f"{last_raw}\n"
                         f"[[[END]]]"
@@ -396,6 +443,50 @@ class AgentLoop:
                         return
 
                     continue
+
+            # Gate mutating actions (file writes, shell) behind confirmation
+            # before anything touches the local filesystem. Read-only actions
+            # are always safe and execute unconditionally.
+            requested = [
+                entry
+                for entry in plan
+                if entry.get("action") in ("file_write", "shell")
+            ]
+            plan = await self._confirm_plan(plan)
+            approved = [
+                entry
+                for entry in plan
+                if entry.get("action") in ("file_write", "shell")
+            ]
+
+            results = self.tools.execute_planned(plan)
+
+            # All mutating actions were declined. Tell the LLM so it can adapt
+            # instead of blindly retrying the same blocked actions.
+            if requested and not approved:
+                yield AgentEvent(
+                    "status",
+                    "Local changes declined; asking for an updated plan...",
+                )
+
+                decline = (
+                    "The user reviewed your proposed FILE and SHELL actions and "
+                    "declined them, so nothing was written or run on the local "
+                    "machine. Explain what you intended, or propose a different "
+                    "approach the user may approve. Use TASK_COMPLETE only when "
+                    "the user has clearly accepted the outcome."
+                )
+
+                try:
+                    last_raw = await self._send_and_wait(decline)
+                except Exception as exc:
+                    yield AgentEvent(
+                        "error",
+                        f"Decline transaction failed: {exc}",
+                    )
+                    return
+
+                continue
 
             cleaned = clean_llm_text(last_raw)
 
