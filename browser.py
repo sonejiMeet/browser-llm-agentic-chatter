@@ -265,7 +265,7 @@ class BrowserBridge:
         self._pre_send_response_text = ""
         self._pre_send_response_count = 0
 
-        self.debug = config.get("debug_transactions", True)
+        self.debug = bool(config.get("debug_transactions", False))
         self._transaction_id = 0
 
     # ── diagnostics ───────────────────────────────────────────────
@@ -1014,4 +1014,4 @@ class BrowserBridge:
             return "\n\n---\n\n".join(parts)
 
         except Exception:
-            return "[Could not read conversation]"
+            return "[Could not read conversation]"  

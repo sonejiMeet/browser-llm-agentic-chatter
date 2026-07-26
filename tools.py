@@ -1,418 +1,807 @@
 """
-tools.py - Local tool execution.
-Runs shell commands, reads/writes files. Returns structured results with
-git-like change logs for agent feedback.
+tools.py - Local tool execution for Browser LLM Agent.
 
-Outputs destined for the browser chat LLM are privacy-redacted (no home
-paths, usernames, or absolute local identity).
+Protocol accepted from browser-hosted models:
+
+[[[SHELL]]]
+command
+[[[END]]]
+
+[[[FILE relative/path.py]]]
+file contents
+[[[END]]]
+
+[[[FILE path="relative/path.py"]]]
+file contents
+[[[END]]]
+
+[[[READ relative/path.py]]]
+[[[END]]]
 """
+
+from __future__ import annotations
 
 import difflib
 import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
-
-from privacy import redact_path_for_llm, redact_text
+from typing import Any
 
 
-def _truncate(text: str, limit: int = 6000) -> str:
-    if len(text) <= limit:
-        return text
-    half = limit // 2
-    omitted = len(text) - limit
-    return (
-        text[:half]
-        + f"\n\n... [{omitted} chars omitted] ...\n\n"
-        + text[-half:]
-    )
+_FILE_MARKER_RE = re.compile(
+    r"""
+    \[\[\[\s*FILE\s+
+    (?P<path>[^\]\r\n]+?)
+    \s*\]\]\]
+    (?P<content>.*?)
+    \[\[\[\s*END\s*\]\]\]
+    """,
+    flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+_SHELL_MARKER_RE = re.compile(
+    r"""
+    \[\[\[\s*SHELL\s*\]\]\]
+    (?P<command>.*?)
+    \[\[\[\s*END\s*\]\]\]
+    """,
+    flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+_READ_MARKER_RE = re.compile(
+    r"""
+    \[\[\[\s*READ\s+
+    (?P<path>[^\]\r\n]+?)
+    \s*\]\]\]
+    (?:.*?\[\[\[\s*END\s*\]\]\])?
+    """,
+    flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+_OPEN_FENCE_RE = re.compile(
+    r"^\s*```[A-Za-z0-9_+#.-]*\s*\n?",
+)
+
+_CLOSE_FENCE_RE = re.compile(
+    r"\n?\s*```\s*$",
+)
+
+_LANGUAGE_LABELS = {
+    "asm",
+    "assembly",
+    "bash",
+    "batch",
+    "c",
+    "c#",
+    "c++",
+    "clojure",
+    "cmake",
+    "cpp",
+    "csharp",
+    "css",
+    "csv",
+    "dart",
+    "dockerfile",
+    "elixir",
+    "fish",
+    "fortran",
+    "go",
+    "graphql",
+    "groovy",
+    "haskell",
+    "html",
+    "ini",
+    "java",
+    "javascript",
+    "jinja",
+    "js",
+    "json",
+    "jsonc",
+    "jsx",
+    "julia",
+    "kotlin",
+    "latex",
+    "less",
+    "lisp",
+    "lua",
+    "makefile",
+    "markdown",
+    "md",
+    "nginx",
+    "objective-c",
+    "objc",
+    "perl",
+    "php",
+    "plaintext",
+    "powershell",
+    "properties",
+    "proto",
+    "ps1",
+    "py",
+    "python",
+    "r",
+    "regex",
+    "ruby",
+    "rs",
+    "rust",
+    "sass",
+    "scala",
+    "scss",
+    "shell",
+    "sh",
+    "sql",
+    "swift",
+    "text",
+    "toml",
+    "ts",
+    "tsx",
+    "typescript",
+    "vb",
+    "vue",
+    "xml",
+    "yaml",
+    "yml",
+    "zsh",
+}
 
 
-def _normalize_indent(content: str, marker: str = "→", spaces: int = 4) -> str:
-    """Convert leading indent markers to spaces. '→' = 4 spaces, '→→' = 8."""
+def clean_file_content(content: str) -> str:
+    """
+    Remove browser-chat formatting artifacts immediately before file writing.
+
+    ChatGPT, DeepSeek, Perplexity, Claude, and Gemini may expose a code block's
+    language label in copied response text:
+
+        Python
+        import os
+
+    The standalone language line is only removed when it is the first non-empty
+    line, so normal source content is not modified elsewhere.
+    """
+    if not content:
+        return ""
+
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    content = content.lstrip("\ufeff")
+
+    # Remove outer Markdown fences if present.
+    content = _OPEN_FENCE_RE.sub("", content, count=1)
+    content = _CLOSE_FENCE_RE.sub("", content, count=1)
+
     lines = content.split("\n")
-    out = []
-    for line in lines:
-        if line and line[0] == marker:
-            level = 0
-            for ch in line:
-                if ch == marker:
-                    level += 1
-                else:
-                    break
-            out.append(" " * (level * spaces) + line[level:])
-        else:
-            out.append(line)
-    return "\n".join(out)
 
+    # Remove blank lines directly inside FILE markers.
+    while lines and not lines[0].strip():
+        lines.pop(0)
 
-def _unified_diff(path: str, before: str, after: str, max_lines: int = 80) -> str:
-    """Produce a compact unified diff of file changes."""
-    before_lines = before.splitlines(keepends=True)
-    after_lines = after.splitlines(keepends=True)
-    diff = list(
-        difflib.unified_diff(
-            before_lines,
-            after_lines,
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-            n=2,
-        )
-    )
-    if not diff:
-        return f"(no textual diff for {path})"
-    if len(diff) > max_lines:
-        head = diff[: max_lines - 2]
-        head.append(f"... [{len(diff) - max_lines + 2} more diff lines omitted]\n")
-        diff = head
-    return "".join(diff).rstrip()
+    # Remove a standalone code language label from browser UI extraction.
+    if lines and lines[0].strip().lower() in _LANGUAGE_LABELS:
+        lines.pop(0)
+
+        while lines and not lines[0].strip():
+            lines.pop(0)
+
+    cleaned = "\n".join(lines)
+    cleaned = _CLOSE_FENCE_RE.sub("", cleaned)
+
+    # Text source files should end with one final newline.
+    return cleaned.rstrip() + "\n" if cleaned.strip() else ""
 
 
 class ToolExecutor:
+    """Parse and execute local FILE, READ, and SHELL tool markers."""
+
     def __init__(self, config: dict):
-        self.shell_enabled = config.get("tools", {}).get("shell", {}).get("enabled", True)
-        self.shell_executable = (
-            config.get("tools", {}).get("shell", {}).get("executable", None) or None
+        configured_workspace = (
+            config.get("workspace")
+            or config.get("workspace_dir")
         )
-        self.dangerous_patterns = (
-            config.get("tools", {}).get("shell", {}).get("dangerous_patterns", [])
+
+        if configured_workspace:
+            self.workspace = Path(
+                configured_workspace
+            ).expanduser().resolve()
+        else:
+            self.workspace = Path.cwd().resolve()
+
+        self.workspace.mkdir(parents=True, exist_ok=True)
+
+        tools_config = config.get("tools", {})
+        shell_config = tools_config.get("shell", {})
+        write_config = tools_config.get("file_write", {})
+        read_config = tools_config.get("file_read", {})
+
+        self.shell_enabled = bool(shell_config.get("enabled", True))
+        self.file_write_enabled = bool(
+            write_config.get("enabled", True)
         )
-        self.allowed_write_paths = (
-            config.get("tools", {}).get("file_write", {}).get("allowed_paths", ["~"])
+        self.file_read_enabled = bool(
+            read_config.get("enabled", True)
         )
+
         self.shell_timeout = int(
-            config.get("tools", {}).get("shell", {}).get("timeout", 60)
+            config.get(
+                "shell_timeout_seconds",
+                shell_config.get("timeout_seconds", 120),
+            )
         )
-        self.workspace = Path.cwd()
-        # Accumulated change log for the current session / turn
-        self.change_log: list[dict] = []
+        self.max_read_bytes = int(
+            config.get(
+                "max_read_bytes",
+                read_config.get("max_bytes", 100_000),
+            )
+        )
 
-    def reset_change_log(self):
-        self.change_log = []
+        self.change_log: list[dict[str, Any]] = []
 
-    # ── public API ───────────────────────────────────────────────
+    def reset_change_log(self) -> None:
+        """Clear this task's accumulated file and shell changes."""
+        self.change_log.clear()
 
-    def execute_tool_calls(self, llm_response: str) -> list[dict]:
-        """Parse an LLM response for tool-call blocks and execute each one.
-
-        Uses plain-text markers that survive browser DOM rendering
-        (markdown fences often lose backticks in inner_text()).
+    def execute_tool_calls(self, text: str) -> list[dict[str, Any]]:
         """
-        results: list[dict] = []
+        Parse all complete markers and execute them in their original order.
 
-        # Collect all tool calls with positions so we execute in document order
-        calls: list[tuple[int, str, tuple]] = []
+        A response can mix FILE, SHELL, and READ blocks; preserving their order
+        allows models to create files, then compile or inspect them.
+        """
+        if not text:
+            return []
 
-        for match in re.finditer(
-            r"\[\[\[SHELL\]{2,}\s*\n?(.*?)\[\[\[END\]{2,}", llm_response, re.DOTALL
-        ):
-            calls.append((match.start(), "shell", (match.group(1).strip(),)))
+        calls: list[tuple[int, str, re.Match[str]]] = []
 
-        for match in re.finditer(
-            r'\[\[\[FILE\s+path=["\']?(.*?)["\']?\]{2,}\s*\n?(.*?)\[\[\[END\]{2,}',
-            llm_response,
-            re.DOTALL,
-        ):
-            calls.append((match.start(), "file", (match.group(1).strip(), match.group(2))))
+        for match in _FILE_MARKER_RE.finditer(text):
+            calls.append((match.start(), "file_write", match))
 
-        for match in re.finditer(
-            r'\[\[\[READ\s+path=["\']?(.*?)["\']?\]{2,}', llm_response
-        ):
-            calls.append((match.start(), "read", (match.group(1).strip(),)))
+        for match in _SHELL_MARKER_RE.finditer(text):
+            calls.append((match.start(), "shell", match))
 
-        calls.sort(key=lambda c: c[0])
+        for match in _READ_MARKER_RE.finditer(text):
+            calls.append((match.start(), "file_read", match))
 
-        for _, kind, args in calls:
-            if kind == "shell":
-                results.append(self._run_shell(args[0]))
-            elif kind == "file":
-                results.append(self._write_file(args[0], args[1]))
-            elif kind == "read":
-                results.append(self._read_file(args[0]))
+        calls.sort(key=lambda item: item[0])
+
+        results: list[dict[str, Any]] = []
+
+        for _, kind, match in calls:
+            if kind == "file_write":
+                results.append(
+                    self.write_file(
+                        match.group("path"),
+                        match.group("content"),
+                    )
+                )
+
+            elif kind == "shell":
+                results.append(self.run_shell(match.group("command")))
+
+            elif kind == "file_read":
+                results.append(self.read_file(match.group("path")))
 
         return results
 
-    def format_results(self, results: list[dict]) -> str:
-        """Format execution results for the browser LLM (privacy-redacted).
-        Explicitly flags errors so the LLM knows to FIX, not repeat."""
-        if not results:
-            return ""
-        ws = self.workspace
-        lines = ["[TOOL OUTPUT]"]
-        has_error = False
-        for r in results:
-            if r.get("error"):
-                has_error = True
-                err = redact_text(str(r["error"]), workspace=ws)
-                lines.append(f"FAILED ({r['type']}): {err}")
-            else:
-                body = redact_text(r.get("result", "") or "", workspace=ws)
-                if r["type"] == "file_write" and r.get("diff"):
-                    path = redact_path_for_llm(r.get("path", "?"), workspace=ws)
-                    diff = redact_text(r["diff"], workspace=ws)
-                    lines.append(
-                        f"OK file_write: wrote {r.get('bytes', '?')} bytes to {path}\n"
-                        f"{diff}"
-                    )
-                else:
-                    lines.append(f"OK {r['type']}:\n{_truncate(body, 5000)}")
-        lines.append("[/TOOL OUTPUT]")
+    def write_file(
+        self,
+        relative_path: str,
+        content: str,
+    ) -> dict[str, Any]:
+        """Write cleaned text to a workspace-relative file."""
+        started = time.monotonic()
+        relative_path = self._normalize_tool_path(relative_path)
 
-        if has_error:
-            lines.append(
-                "The command(s) above FAILED. Read the error, CHANGE your approach, "
-                "and try a DIFFERENT fix. Do NOT repeat the same failing command or code. "
-                "Use [[[READ ...]]] to inspect files before editing them."
+        if not self.file_write_enabled:
+            return self._error_result(
+                "file_write",
+                "File writing is disabled by configuration.",
+                path=relative_path,
+                started=started,
             )
-        else:
-            lines.append(
-                "Continue the task. Issue more [[[...]]] tool calls if needed, "
-                "or write SUMMARY + TASK_COMPLETE when done."
-            )
-        return "\n".join(lines)
 
-    def format_agent_report(self, results: list[dict], cleaned_response: str = "") -> str:
-        """Rich report for external display — agent-style activity log."""
-        sections: list[str] = []
-
-        if results:
-            sections.append("Agent Actions:")
-            for i, r in enumerate(results, 1):
-                if r["type"] == "shell":
-                    cmd = r.get("command", "")
-                    status = "ERROR" if r.get("error") else "OK"
-                    exit_code = r.get("exit_code", "?")
-                    duration = r.get("duration_ms", "?")
-                    sections.append(
-                        f"\n### [{i}] shell  ({status}, exit={exit_code}, {duration}ms)\n"
-                        f"$ {cmd}\n"
-                    )
-                    body = r.get("error") or r.get("result", "")
-                    sections.append(f"```\n{_truncate(body, 3000)}\n```")
-                elif r["type"] == "file_write":
-                    path = r.get("path", "?")
-                    status = "ERROR" if r.get("error") else "OK"
-                    if r.get("error"):
-                        sections.append(f"\n### [{i}] file_write  ({status})\n{r['error']}")
-                    else:
-                        mode = r.get("mode", "write")
-                        sections.append(
-                            f"\n### [{i}] file_write  ({status}, {mode})\n"
-                            f"path: {path}  bytes: {r.get('bytes', '?')}"
-                        )
-                        if r.get("diff"):
-                            sections.append(f"```diff\n{r['diff']}\n```")
-                        else:
-                            sections.append(f"Wrote {r.get('bytes', '?')} bytes.")
-                elif r["type"] == "file_read":
-                    path = r.get("path", "?")
-                    status = "ERROR" if r.get("error") else "OK"
-                    sections.append(f"\n### [{i}] file_read  ({status})\npath: {path}")
-                    if r.get("error"):
-                        sections.append(r["error"])
-                    else:
-                        sections.append(
-                            f"```\n{_truncate(r.get('result', ''), 2000)}\n```"
-                        )
-                else:
-                    sections.append(
-                        f"\n### [{i}] {r.get('type', 'tool')}\n"
-                        f"{r.get('error') or r.get('result', '')}"
-                    )
-
-        # Session change log summary (git-like)
-        if self.change_log:
-            sections.append("\nChange Log:")
-            for entry in self.change_log[-30:]:
-                kind = entry.get("kind", "?")
-                path = entry.get("path", "")
-                if kind == "create":
-                    sections.append(f"+ created  {path}  ({entry.get('bytes', 0)} bytes)")
-                elif kind == "modify":
-                    sections.append(
-                        f"~ modified {path}  "
-                        f"(+{entry.get('added', 0)} / -{entry.get('removed', 0)} lines)"
-                    )
-                elif kind == "shell":
-                    sections.append(f"$ {entry.get('command', '')[:120]}")
-                else:
-                    sections.append(f"* {kind} {path}")
-
-        if cleaned_response and cleaned_response.strip():
-            sections.append("\n")
-            sections.append(cleaned_response.strip())
-
-        return "\n".join(sections).strip()
-
-    # ── internal ─────────────────────────────────────────────────
-
-    def _run_shell(self, command: str) -> dict:
-        if not self.shell_enabled:
-            return {
-                "type": "shell",
-                "command": command,
-                "error": "Shell execution disabled in config",
-            }
-
-        for pattern in self.dangerous_patterns:
-            if pattern in command:
-                return {
-                    "type": "shell",
-                    "command": command,
-                    "error": f"Command matches dangerous pattern '{pattern}'. Refusing.",
-                }
-
-        t0 = time.time()
         try:
-            if self.shell_executable:
-                result = subprocess.run(
-                    [self.shell_executable, "-Command", command],
-                    capture_output=True,
-                    text=True,
-                    timeout=self.shell_timeout,
-                    cwd=str(self.workspace),
-                )
-            else:
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.shell_timeout,
-                    cwd=str(self.workspace),
-                )
-            duration_ms = int((time.time() - t0) * 1000)
-            output = result.stdout or ""
-            if result.stderr:
-                output += ("\n[stderr]\n" if output else "[stderr]\n") + result.stderr
-            if not output.strip():
-                output = f"(exit code {result.returncode}, no output)"
-            # Redact home/username paths before any downstream consumer
-            output = redact_text(output.strip(), workspace=self.workspace)
+            target = self._resolve_path(relative_path)
+        except ValueError as exc:
+            return self._error_result(
+                "file_write",
+                str(exc),
+                path=relative_path,
+                started=started,
+            )
 
-            entry = {
-                "type": "shell",
-                "command": command,
-                "result": output,
-                "exit_code": result.returncode,
-                "duration_ms": duration_ms,
-            }
-            self.change_log.append({"kind": "shell", "command": command, "exit_code": result.returncode})
-            return entry
+        content = clean_file_content(content)
+
+        if not content.strip():
+            return self._error_result(
+                "file_write",
+                "Refusing to write an empty file after content cleanup.",
+                path=relative_path,
+                started=started,
+            )
+
+        existed = target.exists()
+        old_content = ""
+
+        if existed:
+            try:
+                old_content = target.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                return self._error_result(
+                    "file_write",
+                    (
+                        "Refusing to overwrite a non-UTF-8 file: "
+                        f"{relative_path}"
+                    ),
+                    path=relative_path,
+                    started=started,
+                )
+            except OSError as exc:
+                return self._error_result(
+                    "file_write",
+                    f"Could not read existing file: {exc}",
+                    path=relative_path,
+                    started=started,
+                )
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return self._error_result(
+                "file_write",
+                f"Could not write {relative_path}: {exc}",
+                path=relative_path,
+                started=started,
+            )
+
+        mode = "modify" if existed else "create"
+        byte_count = len(content.encode("utf-8"))
+        duration_ms = self._duration_ms(started)
+        added, removed = self._diff_counts(old_content, content)
+
+        log_entry: dict[str, Any] = {
+            "kind": mode,
+            "path": relative_path,
+            "bytes": byte_count,
+        }
+
+        if existed:
+            log_entry["added"] = added
+            log_entry["removed"] = removed
+
+        self.change_log.append(log_entry)
+
+        action = "Updated" if existed else "Created"
+
+        return {
+            "type": "file_write",
+            "path": relative_path,
+            "mode": mode,
+            "bytes": byte_count,
+            "result": f"{action} {relative_path} ({byte_count} bytes).",
+            "diff": self._make_diff(
+                old_content,
+                content,
+                relative_path,
+            ),
+            "duration_ms": duration_ms,
+        }
+
+    def read_file(self, relative_path: str) -> dict[str, Any]:
+        """Read one UTF-8 text file from the workspace."""
+        started = time.monotonic()
+        relative_path = self._normalize_tool_path(relative_path)
+
+        if not self.file_read_enabled:
+            return self._error_result(
+                "file_read",
+                "File reading is disabled by configuration.",
+                path=relative_path,
+                started=started,
+            )
+
+        try:
+            target = self._resolve_path(relative_path)
+        except ValueError as exc:
+            return self._error_result(
+                "file_read",
+                str(exc),
+                path=relative_path,
+                started=started,
+            )
+
+        if not target.exists():
+            return self._error_result(
+                "file_read",
+                f"File does not exist: {relative_path}",
+                path=relative_path,
+                started=started,
+            )
+
+        if not target.is_file():
+            return self._error_result(
+                "file_read",
+                f"Path is not a file: {relative_path}",
+                path=relative_path,
+                started=started,
+            )
+
+        try:
+            raw = target.read_bytes()
+        except OSError as exc:
+            return self._error_result(
+                "file_read",
+                f"Could not read {relative_path}: {exc}",
+                path=relative_path,
+                started=started,
+            )
+
+        truncated = len(raw) > self.max_read_bytes
+        raw = raw[: self.max_read_bytes]
+
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return self._error_result(
+                "file_read",
+                f"File is not UTF-8 text: {relative_path}",
+                path=relative_path,
+                started=started,
+            )
+
+        if truncated:
+            content += (
+                f"\n\n... [truncated at {self.max_read_bytes} bytes]"
+            )
+
+        return {
+            "type": "file_read",
+            "path": relative_path,
+            "result": content,
+            "bytes": len(raw),
+            "truncated": truncated,
+            "duration_ms": self._duration_ms(started),
+        }
+
+    def run_shell(self, command: str) -> dict[str, Any]:
+        """Run a shell command with the workspace as its working directory."""
+        started = time.monotonic()
+        command = command.strip()
+
+        if not self.shell_enabled:
+            return self._error_result(
+                "shell",
+                "Shell execution is disabled by configuration.",
+                command=command,
+                started=started,
+            )
+
+        if not command:
+            return self._error_result(
+                "shell",
+                "Refusing to run an empty command.",
+                command=command,
+                started=started,
+            )
+
+        try:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(self.workspace),
+                capture_output=True,
+                text=True,
+                timeout=self.shell_timeout,
+                encoding="utf-8",
+                errors="replace",
+            )
         except subprocess.TimeoutExpired:
-            return {
-                "type": "shell",
-                "command": command,
-                "error": f"Command timed out ({self.shell_timeout}s)",
-                "duration_ms": int((time.time() - t0) * 1000),
-            }
-        except Exception as e:
-            return {"type": "shell", "command": command, "error": str(e)}
+            return self._error_result(
+                "shell",
+                (
+                    f"Command timed out after "
+                    f"{self.shell_timeout} seconds."
+                ),
+                command=command,
+                started=started,
+            )
+        except OSError as exc:
+            return self._error_result(
+                "shell",
+                f"Could not run command: {exc}",
+                command=command,
+                started=started,
+            )
 
-    def _path_allowed(self, p: Path) -> bool:
-        return any(
-            str(p).startswith(str(Path(a).expanduser().resolve()))
-            for a in self.allowed_write_paths
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+        output = "\n".join(
+            part
+            for part in (stdout, stderr)
+            if part
         )
 
-    def _write_file(self, path_str: str, content: str) -> dict:
-        # Normalize content: strip a single trailing newline mismatch noise
-        if content.startswith("\n") and not content.startswith("\n\n"):
-            # Marker capture sometimes keeps a leading newline — keep content as-is
-            pass
-        # Drop trailing [[[END]]] leakage if model botched markers
-        content = re.sub(r"\n?\[\[\[END\]{2,}\s*$", "", content)
-        # Convert indent markers (> → 4 spaces, >> → 8 spaces, etc.)
-        content = _normalize_indent(content)
-
-        p = Path(path_str).expanduser()
-        if not p.is_absolute():
-            p = (self.workspace / p).resolve()
-        else:
-            p = p.resolve()
-
-        if not self._path_allowed(p):
-            safe = redact_path_for_llm(p, workspace=self.workspace)
-            return {
-                "type": "file_write",
-                "path": safe,
-                "error": f"Path {safe} is outside the allowed workspace.",
-            }
-
-        try:
-            before = ""
-            existed = p.exists()
-            if existed:
-                try:
-                    before = p.read_text(encoding="utf-8")
-                except Exception:
-                    before = ""
-
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
-
-            rel = self._rel(p)
-            diff = _unified_diff(rel, before, content)
-            before_lines = before.splitlines()
-            after_lines = content.splitlines()
-            # Approximate added/removed
-            sm = difflib.SequenceMatcher(None, before_lines, after_lines)
-            added = removed = 0
-            for tag, i1, i2, j1, j2 in sm.get_opcodes():
-                if tag == "insert":
-                    added += j2 - j1
-                elif tag == "delete":
-                    removed += i2 - i1
-                elif tag == "replace":
-                    removed += i2 - i1
-                    added += j2 - j1
-
-            mode = "create" if not existed else "modify"
-            self.change_log.append(
-                {
-                    "kind": mode,
-                    "path": rel,
-                    "bytes": len(content),
-                    "added": added,
-                    "removed": removed,
-                }
+        if not output:
+            output = (
+                "Command completed successfully."
+                if completed.returncode == 0
+                else (
+                    "Command failed with exit code "
+                    f"{completed.returncode}."
+                )
             )
-            return {
-                "type": "file_write",
-                "path": rel,
-                "bytes": len(content),
-                "mode": mode,
-                "diff": diff,
-                "result": f"Wrote {len(content)} bytes to {rel} ({mode})",
-            }
-        except Exception as e:
-            return {"type": "file_write", "path": path_str, "error": str(e)}
 
-    def _read_file(self, path_str: str) -> dict:
-        p = Path(path_str).expanduser()
-        if not p.is_absolute():
-            p = (self.workspace / p).resolve()
-        else:
-            p = p.resolve()
-        try:
-            text = p.read_text(encoding="utf-8")
-            # Add line numbers so the LLM can reference specific lines
-            lines = text.split("\n")
-            numbered = "\n".join(f"{i+1:4d}|{line}" for i, line in enumerate(lines))
-            numbered = _truncate(numbered, 8000)
-            rel = self._rel(p)
-            return {
-                "type": "file_read",
-                "path": rel,
-                "result": numbered,
-            }
-        except Exception as e:
-            return {"type": "file_read", "path": path_str, "error": str(e)}
+        duration_ms = self._duration_ms(started)
 
-    def _rel(self, p: Path) -> str:
+        self.change_log.append(
+            {
+                "kind": "shell",
+                "command": command,
+                "exit_code": completed.returncode,
+                "duration_ms": duration_ms,
+            }
+        )
+
+        result: dict[str, Any] = {
+            "type": "shell",
+            "command": command,
+            "result": output,
+            "exit_code": completed.returncode,
+            "duration_ms": duration_ms,
+        }
+
+        if completed.returncode != 0:
+            result["error"] = (
+                f"Command exited with code {completed.returncode}."
+            )
+
+        return result
+
+    def format_results(self, results: list[dict[str, Any]]) -> str:
+        """
+        Format bounded tool feedback for the next model transaction.
+
+        Terminal output can be huge, especially `git diff`, build logs, or
+        generated files. The browser chat only needs enough context to decide
+        the next action, so each result and the combined feedback are capped.
+        """
+        if not results:
+            return "No tool actions were executed."
+
+        max_item_chars = 8_000
+        max_total_chars = 20_000
+        parts: list[str] = []
+
+        for result in results:
+            kind = result.get("type", "tool")
+            error = result.get("error")
+
+            if kind == "file_write":
+                path = result.get("path", "?")
+
+                if error:
+                    item = f"FILE ERROR {path}: {error}"
+                else:
+                    item = f"FILE OK {path}: {result.get('result', '')}"
+
+            elif kind == "file_read":
+                path = result.get("path", "?")
+                content = str(result.get("result", ""))
+
+                if error:
+                    item = f"READ ERROR {path}: {error}"
+                else:
+                    item = f"READ OK {path}:\n{content}"
+
+            elif kind == "shell":
+                command = str(result.get("command", ""))
+                output = str(result.get("result", ""))
+
+                if error:
+                    item = (
+                        f"SHELL ERROR ({command}):\n"
+                        f"{output or error}"
+                    )
+                else:
+                    item = f"SHELL OK ({command}):\n{output}"
+
+            else:
+                item = str(result)
+
+            if len(item) > max_item_chars:
+                omitted = len(item) - max_item_chars
+                item = (
+                    item[:max_item_chars]
+                    + f"\n\n[output truncated: {omitted} characters omitted]"
+                )
+
+            parts.append(item)
+
+        feedback = "\n\n".join(parts)
+
+        if len(feedback) > max_total_chars:
+            omitted = len(feedback) - max_total_chars
+            feedback = (
+                feedback[:max_total_chars]
+                + f"\n\n[tool feedback truncated: {omitted} characters omitted]"
+            )
+
+        return feedback
+    
+    
+    def format_agent_report(
+        self,
+        results: list[dict[str, Any]],
+        final_text: str = "",
+    ) -> str:
+        """Build a short structured report for AgentLoop's done event."""
+        changed = [
+            result.get("path", "?")
+            for result in results
+            if result.get("type") == "file_write"
+            and not result.get("error")
+        ]
+
+        failures = [
+            result.get("error", "Unknown tool error")
+            for result in results
+            if result.get("error")
+        ]
+
+        lines: list[str] = []
+
+        if changed:
+            lines.append("Files changed:")
+            lines.extend(f"- {path}" for path in changed)
+
+        if failures:
+            lines.append("Errors:")
+            lines.extend(f"- {error}" for error in failures)
+
+        if final_text.strip():
+            lines.append("Model returned a final response.")
+
+        return "\n".join(lines) if lines else "No workspace changes."
+
+    @staticmethod
+    def _normalize_tool_path(value: str) -> str:
+        """
+        Normalize file paths emitted by different LLM protocol styles.
+
+        Accepts:
+            src/main.py
+            ./src/main.py
+            path="src/main.py"
+            path='./src/main.py'
+            file="src/main.py"
+            filename="src/main.py"
+        """
+        value = value.strip()
+
+        match = re.match(
+            r"^(?:path|file|filename)\s*=\s*(.+?)\s*$",
+            value,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            value = match.group(1).strip()
+
+        if (
+            len(value) >= 2
+            and value[0] in ('"', "'")
+            and value[-1] == value[0]
+        ):
+            value = value[1:-1].strip()
+
+        while value.startswith("./") or value.startswith(".\\"):
+            value = value[2:]
+
+        return value
+
+    def _resolve_path(self, relative_path: str) -> Path:
+        """
+        Resolve a safe workspace-relative path.
+
+        Absolute paths and traversal outside the workspace are rejected.
+        """
+        relative_path = self._normalize_tool_path(relative_path)
+
+        if not relative_path:
+            raise ValueError("File path is empty.")
+
+        candidate = Path(relative_path)
+
+        if candidate.is_absolute():
+            raise ValueError(
+                f"Absolute paths are not allowed: {relative_path}"
+            )
+
+        resolved = (self.workspace / candidate).resolve()
+
         try:
-            return p.relative_to(self.workspace).as_posix()
-        except ValueError:
-            # Outside workspace — never return raw absolute path (leaks username)
-            return redact_path_for_llm(p, workspace=self.workspace)
+            resolved.relative_to(self.workspace)
+        except ValueError as exc:
+            raise ValueError(
+                f"Path escapes workspace: {relative_path}"
+            ) from exc
+
+        return resolved
+
+    @staticmethod
+    def _make_diff(
+        old_content: str,
+        new_content: str,
+        relative_path: str,
+    ) -> str:
+        """Create a bounded unified diff for file-write UI output."""
+        if old_content == new_content:
+            return f"No content changes in {relative_path}."
+
+        lines = list(
+            difflib.unified_diff(
+                old_content.splitlines(),
+                new_content.splitlines(),
+                fromfile=f"a/{relative_path}",
+                tofile=f"b/{relative_path}",
+                lineterm="",
+            )
+        )
+
+        limit = 400
+
+        if len(lines) > limit:
+            lines = lines[:limit]
+            lines.append(f"... diff truncated after {limit} lines")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _diff_counts(
+        old_content: str,
+        new_content: str,
+    ) -> tuple[int, int]:
+        """Return added and removed line counts."""
+        added = 0
+        removed = 0
+
+        for line in difflib.ndiff(
+            old_content.splitlines(),
+            new_content.splitlines(),
+        ):
+            if line.startswith("+ "):
+                added += 1
+            elif line.startswith("- "):
+                removed += 1
+
+        return added, removed
+
+    @staticmethod
+    def _duration_ms(started: float) -> int:
+        """Return elapsed monotonic time in milliseconds."""
+        return int((time.monotonic() - started) * 1000)
+
+    def _error_result(
+        self,
+        kind: str,
+        error: str,
+        *,
+        path: str | None = None,
+        command: str | None = None,
+        started: float,
+    ) -> dict[str, Any]:
+        """Return a consistently shaped failed tool result."""
+        result: dict[str, Any] = {
+            "type": kind,
+            "error": error,
+            "result": f"ERROR: {error}",
+            "duration_ms": self._duration_ms(started),
+        }
+
+        if path is not None:
+            result["path"] = path
+
+        if command is not None:
+            result["command"] = command
+            result["exit_code"] = -1
+
+        return result
