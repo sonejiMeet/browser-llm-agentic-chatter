@@ -763,7 +763,9 @@ def load_config(path: str | None = None) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Browser LLM Agent"
+        prog="orbit",
+        description="Orbit. A Browser LLM Agent",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
         "task",
@@ -773,21 +775,25 @@ def main() -> None:
     parser.add_argument(
         "--provider",
         "-p",
+        metavar="P",
         help="chatgpt, claude, gemini, perplexity, deepseek",
     )
     parser.add_argument(
         "--model",
         "-m",
+        metavar="M",
         help="Model name, for example expert, GPT-4o, or Sonar",
-    )
-    parser.add_argument(
-        "--config",
-        help="Path to config.yaml",
     )
     parser.add_argument(
         "--workspace",
         "-w",
+        metavar="W",
         help="Working directory for local tools",
+    )
+    parser.add_argument(
+        "--config",
+        metavar="C",
+        help="Path to config.yaml",
     )
     parser.add_argument(
         "--list-models",

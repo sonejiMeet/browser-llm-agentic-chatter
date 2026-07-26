@@ -1,72 +1,98 @@
 # Browser LLM Agent
 
-Drive web-based LLMs (ChatGPT, Claude, Gemini, Perplexity) as autonomous coding agents — **no API key needed**. Uses your existing browser session/subscription via Playwright.
+Use ChatGPT, Claude, Gemini, Perplexity, or DeepSeek in your browser as a local coding agent — no API key required.
 
-The agent reads your task, controls the chat LLM through text markers, executes shell commands and file operations locally, and feeds results back. It loops autonomously until the task is done.
+The agent uses your existing browser session, writes files, runs shell commands, and feeds results back to the LLM until the task is complete.
 
-## Quick Start
-
-### One-command setup (Linux, WSL2, Windows)
+## Setup
 
 ```bash
+git clone <repo-url>
+cd browser-llm-agent
 python setup.py
 ```
 
-## CLI Usage
+Setup creates a local `.venv`, installs dependencies and Playwright Chromium, then installs the `orbit` command.
+
+Close and reopen your terminal after setup.
+
+## Usage
+
+Open a terminal in the folder where you want the agent to work:
 
 ```bash
-python cli.py                          # default: chatgpt
-python cli.py -p deepseek -m expert
-python cli.py --p perplexity
-python cli.py --task "Create a hello.py"
+cd path/to/your/project
+orbit
 ```
 
-Inside the REPL:
+Run a task directly:
 
-| Command | Action |
-|---------|--------|
-| `/help` | Show commands |
-| `/clear` | Clear session and screen |
-| `/history` | Show conversation history |
-| `/changes` | Show file/shell change log |
-| `/provider` | Show current provider/model |
-| `/debug on` | Enable transaction diagnostics |
-| `/debug off` | Disable transaction diagnostics |
-| `/debug status` | Show diagnostic state |
-| `/debug toggle` | Toggle transaction diagnostics |
-| `/exit` | Quit |
+```bash
+orbit "Create a hello.py"  # one-shot 
+orbit -p deepseek -m expert  # preferred, CLI chat
+orbit --provider deepseek --model expert "Fix the current build"
+orbit --provider perplexity "Review this project"
+```
 
-`Alt+Enter` for multi-line input.
+`orbit` uses the agent's installed virtual environment automatically. You do not need to activate `.venv`.
+
+Run this for all options:
+
+```bash
+orbit --help
+```
 
 ## How It Works
 
-The agent types into the browser chat using Playwright. It sends a system prompt teaching the LLM a plain-text marker protocol:
+On first run, log in to the selected provider in the browser window.
 
-```
+The agent sends instructions to the browser LLM, which responds with simple action markers:
+
+```text
 [[[SHELL]]]
 dir
 [[[END]]]
 
-[[[FILE path="./script.py"]]]
+[[[FILE path="./hello.py"]]]
 print("hello")
 [[[END]]]
-
-[[[READ path="./script.py"]]]
 ```
 
-Login in the browser window on first run. The profile persists in `./browser_profile/`.
+The agent executes the actions locally and sends the results back to the LLM.
 
-## Project Structure
+## Providers
 
-```
-setup.py          One-command setup script
-agent.py          Single-shot mode
-cli.py            Interactive Rich REPL
-agent_core.py     Agent loop, event system, prompt builder
-browser.py        Playwright wrapper (type, submit, read responses)
-tools.py          Shell execution, file read/write, change tracking
-context.py        Workspace context gathering, turn feedback
-privacy.py        Redacts local paths/identity before sending to cloud
-session.py        Conversation history and auto-summarization
-config.yaml       Provider, model, tool, and prompt configuration
+- `chatgpt` — default
+- `claude`
+- `gemini`
+- `perplexity`
+- `deepseek`
+
+Configure the default provider or model in `config.yaml`.
+
+## Commands
+
+Inside interactive mode:
+
+| Command | Action |
+|---|---|
+| `/help` | Show commands |
+| `/clear` | Clear session and screen |
+| `/history` | Show conversation history |
+| `/changes` | Show file and shell changes |
+| `/provider` | Show provider and model |
+| `/debug on` | Enable transaction diagnostics |
+| `/debug off` | Disable transaction diagnostics |
+| `/exit` | Quit |
+
+Use `Alt+Enter` for multi-line input.
+
+## Notes
+
+- Your browser profile is stored in `./browser_profile/`.
+- The agent works in the folder where you run `orbit`.
+- On Linux/WSL2, if `orbit` is not found after setup, run:
+
+```bash
+source ~/.profile
 ```
