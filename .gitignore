@@ -1,3 +1,10 @@
-.venv
-browser_profile
-__pycache__
+.venv/
+venv/
+browser_profile/
+.browser-agent/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+!.env.example

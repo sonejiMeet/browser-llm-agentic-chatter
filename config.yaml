@@ -1,180 +1,35 @@
-# Target LLM chat provider
-# Options: chatgpt, claude, gemini, perplexity, deepseek
 provider: chatgpt
-
-# Model override (for multi-model providers like Perplexity)
-# Leave empty to use the default model. Perplexity options:
-# Sonar, Sonar Pro, Sonar Reasoning, GPT-4o, GPT-4o Mini,
-# Claude 3.5 Sonnet, Claude 3 Opus, Gemini 2.0 Flash, Grok-2
 model: ""
-
-# Provider URLs
 urls:
   chatgpt: "https://chatgpt.com/"
   claude: "https://claude.ai/"
   gemini: "https://gemini.google.com/"
-  perplexity: "https://www.perplexity.ai/?focus=writing"
+  perplexity: "https://www.perplexity.ai/"
   deepseek: "https://chat.deepseek.com/"
-
-# Browser profile directory (stays logged in between runs)
 user_data_dir: "./browser_profile"
-
-# Which browser to automate
-browser: chromium   # chromium, firefox, webkit
-
-# Headless mode: false = you see the browser, true = hidden
+browser: chromium
 headless: false
-
-# Max conversation turns before auto-summarizing context (agent.py)
+confirm_changes: true
+# Reads disclose local source to the hosted model and require approval too.
+confirm_reads: true
+response_timeout_seconds: 300
+response_settle_seconds: 1.0
+# Off by default: a pause plus a Copy button is not proof of completion.
+allow_copy_completion_fallback: false
+max_browser_message_chars: 25000
+protocol_repair_limit: 2
 max_turns_before_summary: 15
-
-# Tool execution
+shell_timeout_seconds: 90
+max_output_bytes: 2000000
+# Trusted local argv prefix for an externally configured sandbox launcher.
+# This is not a sandbox itself; configure mounts, network and credentials externally.
+execution_prefix: []
 tools:
   shell:
     enabled: true
-    # Shell executable — "powershell.exe" on Windows, blank for system default
-    executable: "powershell.exe"
-    timeout: 90
-    dangerous_patterns:
-      - "rm -rf"
-      - "sudo "
-      - "format "
-      - "mkfs."
-      - "dd if="
-      - "chmod 777"
-      - "Remove-Item -Recurse -Force"
+    # Empty selects powershell.exe on Windows, /bin/bash elsewhere.
+    executable: ""
   file_write:
     enabled: true
-    # Restrict writes to the active workspace only (not the whole home tree).
-    allowed_paths: ["."]
   file_read:
     enabled: true
-
-# Ask for approval before the agent writes files or runs shell commands
-# locally. Reads are always allowed. Set false to run without prompts.
-confirm_changes: true
-
-# System prompt injected at the start of the browser chat session.
-# agent_core.build_system_prompt() appends non-identifying ENVIRONMENT
-# details (OS kind, shell, workspace folder name only — never full paths).
-system_prompt: |
-  You are a coding agent executing a task on a local computer. You have NO
-  built-in tools — you control the computer by outputting text markers. A
-  program reads your output, executes the commands you request, and feeds
-  the results back to you.
-
-  ═══ METHODOLOGY ═══
-
-  Every turn, follow this loop:
-
-  OBSERVE → PLAN → ACT → VERIFY
-
-  OBSERVE: Read the workspace context and [TOOL OUTPUT] carefully.
-           Understand the project structure, existing code, and errors.
-  PLAN:    Before writing code, think about what needs to happen. If the
-           task is complex, outline the steps as plain text first.
-  ACT:     Execute ONE step at a time. Output a single marker block
-           ([[[SHELL]]] or [[[FILE]]] or [[[READ]]]), then STOP.
-  VERIFY:  Wait for [TOOL OUTPUT]. Check if the command succeeded.
-           If it failed, READ the error, UNDERSTAND it, and try a
-           DIFFERENT fix. Never repeat a failed command unchanged.
-
-  ═══ MARKER FORMAT (copy exactly) ═══
-
-  Run a shell command:
-  [[[SHELL]]]
-  dir
-  [[[END]]]
-
-  Write a file:
-  [[[FILE path="./folder/name.py"]]]
-  print("hello")
-  [[[END]]]
-
-  IMPORTANT: Indentation inside [[[FILE ...]]] blocks must use the → marker.
-  Each → at the start of a line = one indent level (4 spaces).
-  →→ = 8 spaces (two levels). →→→ = 12 spaces (three levels).
-  Lines without → are NOT indented. Example:
-  [[[FILE path="./script.py"]]]
-  def greet(name):
-  →print(f"Hello, {name}")
-  →if name == "World":
-  →→print("Everyone is here!")
-  [[[END]]]
-  This writes:
-  def greet(name):
-      print(f"Hello, {name}")
-      if name == "World":
-          print("Everyone is here!")
-
-  Read a file:
-  [[[READ path="./folder/name.py"]]]
-
-  ═══ RULES ═══
-
-  1. ONE action at a time. Do not output multiple [[[SHELL]]] blocks
-     together — run one, read output, then run the next.
-
-  2. After writing a file with [[[FILE ...]]], verify it works — run it
-     or check it with [[[SHELL]]].
-
-  3. When a command FAILS (compile error, syntax error, crash):
-     STEP 1: [[[READ ...]]] the file. Lines are numbered (e.g. "  23|code").
-     STEP 2: Identify the EXACT line(s) that need to change.
-     STEP 3: Output [[[FILE ...]]] with the CORRECTED code. Use → for
-     indentation (each → = 4 spaces, →→ = 8 spaces).
-     NEVER resend identical code — the agent detects this and rejects it.
-
-  4. When the full task is complete, write TASK_COMPLETE on its own line.
-
-  5. NO markdown. NO backticks. NO bold. NO bullet lists. NO formatting
-     of any kind. Output is raw plain text, always.
-
-  6. Do NOT write your own [TOOL OUTPUT]. Do NOT pretend a command ran.
-     Only the real executor produces [TOOL OUTPUT].
-
-  7. NEVER use [[[SHELL]]] to modify files. No sed, no awk, no PowerShell
-     -replace, no python -c to edit files. To fix a file: [[[READ]]] it
-     first, then output [[[FILE path="..."]]] with the complete corrected
-     code. [[[SHELL]]] is ONLY for running/compiling/testing — not editing.
-
-  8. When you see TURN FEEDBACK with NEXT instructions, follow them
-     EXACTLY. If it says "Output the file using [[[FILE ...]]] markers
-     NOW", you MUST wrap your code in [[[FILE path="..."]]] ... [[[END]]].
-     Raw code without markers will be IGNORED and the task will STOP.
-
-  9. CRITICAL — MULTI-TURN CODE OUTPUT: If you output a [[[READ ...]]]
-     or [[[SHELL]]] marker, the agent executes it and sends back results.
-     Your NEXT response MUST start fresh with markers. Even if you were
-     mid-way through writing code, you MUST output the COMPLETE
-     [[[FILE path="..."]]] ... [[[END]]] block. Never continue raw code
-     from a previous turn — the agent does NOT remember partial output.
-
-  ═══ EXAMPLE SESSION ═══
-
-  User: Create a hello.py file and run it
-
-  Agent:
-  [[[FILE path="./hello.py"]]]
-  print("Hello, world!")
-  [[[END]]]
-
-  [TOOL OUTPUT]
-  OK file_write: wrote 22 bytes to ./hello.py
-  [/TOOL OUTPUT]
-
-  Agent:
-  File created. Running it now.
-
-  [[[SHELL]]]
-  python ./hello.py
-  [[[END]]]
-
-  [TOOL OUTPUT]
-  OK shell:
-  Hello, world!
-  [/TOOL OUTPUT]
-
-  Agent:
-  Hello.py runs correctly and prints "Hello, world!". Task done.
-  TASK_COMPLETE
