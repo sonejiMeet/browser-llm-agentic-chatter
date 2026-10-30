@@ -101,10 +101,26 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('error', await self.tools.execute(action('read_file',{'path':p})))
 
     async def test_ranges(self):
-        (self.root/'a').write_text('one\ntwo\nthree\n',encoding='utf-8')
-        result = await self.tools.execute(action('read_file',{'path':'a','start_line':2,'end_line':2}))
-        self.assertEqual(result['content'],'2|two\n')
-        self.assertEqual(result['next_line'],3)
+        for newline in (b'\n', b'\r\n'):
+            with self.subTest(newline=newline):
+                raw = newline.join([b'one', b'two', b'three', b''])
+                (self.root / 'a').write_bytes(raw)
+
+                result = await self.tools.execute(
+                    action(
+                        'read_file',
+                        {'path': 'a', 'start_line': 2, 'end_line': 2},
+                    )
+                )
+
+                self.assertNotIn('error', result)
+                self.assertEqual(
+                    result['content'],
+                    '2|two' + newline.decode('ascii'),
+                )
+                self.assertEqual(result['next_line'], 3)
+                self.assertEqual(result['sha256'], digest(raw))
+                self.assertEqual((self.root / 'a').read_bytes(), raw)
 
     async def test_search_and_list(self):
         (self.root/'a.py').write_text('one\ntwo\n',encoding='utf-8')
