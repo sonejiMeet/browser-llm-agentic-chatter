@@ -105,4 +105,7 @@ class DeepSeekAdapter(ProviderAdapter):
 ADAPTERS = {'deepseek': DeepSeekAdapter}
 
 def adapter_for(provider, page, selectors):
+    if provider == 'chatgpt':
+        from chatgpt_adapter import ChatGPTAdapter
+        return ChatGPTAdapter(page, selectors)
     return ADAPTERS.get(provider, ProviderAdapter)(page, selectors)
