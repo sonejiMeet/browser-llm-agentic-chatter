@@ -1,4 +1,4 @@
-"""Provider DOM boundary. No tool parsing or payload cleanup lives here."""
+"""Provider DOM extraction and response-level completion evidence."""
 import hashlib
 import re
 from dataclasses import dataclass
@@ -22,33 +22,61 @@ EXTRACT_JS = r"""node => {
     return clone.textContent || '';
 }"""
 
+READY_JS = r"""(node, selector) => {
+    const visible = n => {
+        const s = getComputedStyle(n), r = n.getBoundingClientRect();
+        return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    };
+    // A code-block Copy button is not evidence that the response finished.
+    let scope = node;
+    for (let depth = 0; scope && depth < 4; depth++, scope = scope.parentElement) {
+        if (scope.matches('body,main') || scope.querySelector('[data-message-author-role="user"]')) break;
+        const roots = [...scope.querySelectorAll(selector)].filter(n => !n.parentElement?.closest(selector) || n === node);
+        if (roots.some(n => n !== node && !node.contains(n))) break;
+        if (scope.matches('[aria-busy="true"],[data-is-streaming="true"]') || scope.querySelector('[aria-busy="true"],[data-is-streaming="true"]')) return false;
+        const buttons = [...scope.querySelectorAll('button,[role="button"]')];
+        if (buttons.some(button => {
+            if (!visible(button) || button.closest('pre,code') || button.getAttribute('aria-disabled') === 'true' || button.disabled) return false;
+            const label = [button.getAttribute('aria-label'), button.getAttribute('title'), button.getAttribute('data-testid'), button.textContent].filter(Boolean).join(' ');
+            return /\bcopy\b|copy-turn-action/i.test(label);
+        })) return true;
+    }
+    return false;
+}"""
+
 class ProviderAdapter:
     def __init__(self, page, selectors):
         self.page, self.selectors = page, selectors
         self.baseline_errors = set()
 
     async def snapshot(self):
-        nodes = self.page.locator(self.selectors['response'])
-        visible = [nodes.nth(i) for i in range(await nodes.count()) if await nodes.nth(i).is_visible()]
-        # Select outermost matching message roots, not nested markdown fragments.
+        selector = self.selectors['response']
+        nodes = self.page.locator(selector)
         roots = []
-        for node in visible:
-            nested = await node.evaluate('(n, selector) => !!n.parentElement?.closest(selector)', self.selectors['response'])
-            if not nested:
+        for i in range(await nodes.count()):
+            node = nodes.nth(i)
+            if not await node.is_visible():
+                continue
+            if await node.evaluate("n => !!n.closest('[data-message-author-role=\"user\"]')"):
+                continue
+            if not await node.evaluate('(n, s) => !!n.parentElement?.closest(s)', selector):
                 roots.append(node)
         text, identity, ready = '', '', False
+        busy = False
         if roots:
             latest = roots[-1]
             text = (await latest.evaluate(EXTRACT_JS)).strip()
             identity = await latest.evaluate("n => n.getAttribute('data-message-id') || n.id || ''")
-            copy = latest.locator('button[aria-label*="copy" i],button[title*="copy" i]')
-            ready = await copy.count() > 0
+            ready = await latest.evaluate(READY_JS, selector)
+            busy = await latest.evaluate("n => !!n.closest('[aria-busy=\"true\"],[data-is-streaming=\"true\"]') || !!n.querySelector('[aria-busy=\"true\"],[data-is-streaming=\"true\"]')")
         stop = self.selectors.get('stop_button')
-        generating = False
         if stop:
             buttons = self.page.locator(stop)
-            generating = any([await buttons.nth(i).is_visible() for i in range(await buttons.count())])
-        return Snapshot(len(roots), identity, text, generating, ready)
+            for i in range(await buttons.count()):
+                if await buttons.nth(i).is_visible():
+                    busy = True
+                    break
+        return Snapshot(len(roots), identity, text, busy, ready)
 
     async def errors(self):
         return set()
@@ -57,9 +85,7 @@ class ProviderAdapter:
         self.baseline_errors = await self.errors()
 
     async def rejection(self):
-        errors = await self.errors()
-        fresh = errors - self.baseline_errors
-        return next(iter(fresh), '')
+        return next(iter(await self.errors() - self.baseline_errors), '')
 
 class DeepSeekAdapter(ProviderAdapter):
     async def errors(self):
@@ -69,7 +95,6 @@ class DeepSeekAdapter(ProviderAdapter):
             node = nodes.nth(i)
             if not await node.is_visible():
                 continue
-            # Exclude assistant prose and quoted examples of provider errors.
             if await node.evaluate('(n, s) => !!n.closest(s)', self.selectors['response']):
                 continue
             text = ' '.join((await node.inner_text()).split())
