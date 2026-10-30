@@ -1,4 +1,4 @@
-"""Durable call records. An interrupted mutation is never silently replayed."""
+"""Durable calls scoped by host turn, with legacy-record compatibility."""
 import hashlib
 import json
 import sqlite3
@@ -41,28 +41,39 @@ class Journal:
         self.db.execute("INSERT INTO events(run,state,data,at) VALUES(?,?,?,?)", (run, state, canonical(data), time.time()))
         self.db.commit()
 
-    def lookup(self, run, action):
+    @staticmethod
+    def _call_key(action, turn_id):
+        # Existing unscoped records remain readable; active runs pass the
+        # host-generated, validated turn ID explicitly. No history is erased.
+        if turn_id is None:
+            return action["id"]
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ValueError("A nonempty host turn ID is required")
+        return canonical([turn_id, action["id"]])
+
+    def lookup(self, run, action, turn_id=None):
         fp = fingerprint(action)
-        row = self.db.execute("SELECT fingerprint,state,result FROM calls WHERE run=? AND id=?", (run, action["id"])).fetchone()
+        key = self._call_key(action, turn_id)
+        row = self.db.execute("SELECT fingerprint,state,result FROM calls WHERE run=? AND id=?", (run, key)).fetchone()
         if row:
             if row[0] != fp:
-                raise ValueError("Action ID reused with different arguments")
+                raise ValueError("Action ID reused with different arguments in the same turn")
             if row[1] != "DONE":
                 raise RuntimeError("Execution outcome unknown; inspect local effects before continuing")
             return json.loads(row[2])
         return None
 
-    def claim(self, run, action):
-        cached = self.lookup(run, action)
+    def claim(self, run, action, turn_id=None):
+        cached = self.lookup(run, action, turn_id)
         if cached is not None:
             return cached
         fp = fingerprint(action)
-        self.db.execute("INSERT INTO calls VALUES(?,?,?,?,NULL)", (run, action["id"], fp, "EXECUTING"))
+        self.db.execute("INSERT INTO calls VALUES(?,?,?,?,NULL)", (run, self._call_key(action, turn_id), fp, "EXECUTING"))
         self.db.commit()
         return None
 
-    def finish(self, run, action, result):
-        self.db.execute("UPDATE calls SET state='DONE',result=? WHERE run=? AND id=?", (canonical(result), run, action["id"]))
+    def finish(self, run, action, result, turn_id=None):
+        self.db.execute("UPDATE calls SET state='DONE',result=? WHERE run=? AND id=?", (canonical(result), run, self._call_key(action, turn_id)))
         self.db.commit()
 
     def history(self, run):

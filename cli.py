@@ -53,11 +53,29 @@ class AgentShell:
         self.stop_status()
         try:
             for entry in plan:
-                console.print(Panel(Syntax(json.dumps(entry, ensure_ascii=False, indent=2), 'json', word_wrap=True), title='Review exact action', border_style='yellow'))
-                if entry.get('diff'):
-                    console.print(Panel(Syntax(entry['diff'], 'diff', word_wrap=True), title='Proposed changes', border_style='yellow'))
-            answer = await self.prompt.prompt_async('Apply this action? [y/N] ')
-            return answer.strip().lower() == 'y'
+                metadata = {key: value for key, value in entry.items() if key not in {'content', 'diff', 'replacements'}}
+                if 'replacements' in entry:
+                    metadata['replacement_count'] = len(entry['replacements'])
+                console.print(Panel(Syntax(json.dumps(metadata, ensure_ascii=False, indent=2), 'json', word_wrap=True), title='Review action', border_style='yellow'))
+                if entry.get('action') == 'file_write':
+                    if entry.get('base_sha256') is None and 'content' in entry:
+                        lexer = 'markdown' if str(entry.get('path', '')).endswith('.md') else 'text'
+                        console.print(Panel(Syntax(entry['content'], lexer, word_wrap=True), title='New file contents (empty if blank)', border_style='yellow'))
+                    elif entry.get('diff'):
+                        console.print(Panel(Syntax(entry['diff'], 'diff', word_wrap=True), title='Proposed changes', border_style='yellow'))
+            while True:
+                answer = (await self.prompt.prompt_async('Apply this action? [y/yes/N/no; v = full arguments] ')).strip().lower()
+                if answer in {'y', 'yes'}:
+                    console.print('Approved.', style='dim green')
+                    return True
+                if answer in {'', 'n', 'no'}:
+                    console.print('Declined. No action executed.', style='dim yellow')
+                    return False
+                if answer == 'v':
+                    for entry in plan:
+                        console.print(Syntax(json.dumps(entry, ensure_ascii=False, indent=2), 'json', word_wrap=True))
+                else:
+                    console.print('Enter y/yes to approve or n/no to decline. Enter alone declines.', style='yellow')
         finally:
             self.approving = False
             if self.status is not None:

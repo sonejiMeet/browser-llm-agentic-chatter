@@ -88,7 +88,7 @@ class AgentLoop:
                     return
                 batch = []
                 for action in response['actions']:
-                    cached = self.journal.lookup(run, action)
+                    cached = self.journal.lookup(run, action, turn_id=turn_id)
                     if cached is not None:
                         batch.append(cached)
                         continue
@@ -101,7 +101,7 @@ class AgentLoop:
                     needs_approval = action['tool'] in MUTATING or self.config.get('confirm_reads', True)
                     bound = fingerprint({'action': action, 'prepared': prepared})
                     if needs_approval and self.config.get('confirm_changes', True):
-                        self.journal.event(run, 'AWAITING_APPROVAL', {'action': action, 'prepared': prepared, 'fingerprint': bound})
+                        self.journal.event(run, 'AWAITING_APPROVAL', {'turn_id': turn_id, 'action': action, 'prepared': prepared, 'fingerprint': bound})
                         approved = self.confirm is not None and await self.confirm([copy.deepcopy(prepared)]) is True
                         if not approved:
                             result = {'id': action['id'], 'type': action['tool'], 'error': 'User declined; no action executed'}
@@ -109,7 +109,7 @@ class AgentLoop:
                             break
                     if fingerprint({'action': action, 'prepared': prepared}) != bound:
                         raise RuntimeError('Approved action changed')
-                    cached = self.journal.claim(run, action)
+                    cached = self.journal.claim(run, action, turn_id=turn_id)
                     if cached is not None:
                         batch.append(cached)
                         continue
@@ -133,7 +133,7 @@ class AgentLoop:
                                 await task
                             except asyncio.CancelledError:
                                 pass
-                    self.journal.finish(run, action, result)
+                    self.journal.finish(run, action, result, turn_id=turn_id)
                     batch.append(result)
                     yield AgentEvent('tool_result', json.dumps(result, ensure_ascii=False), {'tool': action['tool'], 'ok': 'error' not in result})
                     if 'error' in result:
